@@ -1,0 +1,1133 @@
+# WatchHand: Enabling Continuous Hand Pose Tracking On Off-the-Shelf Smartwatches
+
+
+# WatchHand: Enabling Continuous Hand Pose Tracking On Off-the-Shelf SmartwatchesConference: Proceedings of the 2026 CHI Conference on Human Factors in Computing Systems; April 13–17, 2026; Barcelona, SpainProceedings of the 2026 CHI Conference on Human Factors in Computing Systems (CHI ’26), April 13–17, 2026, Barcelona, SpainDOI: 10.1145/3772318.3790932ISBN: 979-8-4007-2278-3/2026/04CCS: Human-centered computing Gestural inputCCS: Human-centered computing Sound-based input / outputCCS: Human-centered computing Mobile devices
+
+Jiwan KimAffiliation:KAIST,Daejeon,Republic of Koreaemail:[jiwankim@kaist.ac.kr](mailto:jiwankim@kaist.ac.kr)Note:Contributed equally to this paper,Chi-Jung LeeAffiliation:Cornell University,Ithaca,New York,USAemail:[cl2358@cornell.edu](mailto:cl2358@cornell.edu),Hohurn JungAffiliation:KAIST,Daejeon,Republic of Koreaemail:[cllocker@kaist.ac.kr](mailto:cllocker@kaist.ac.kr),Tianhong Catherine YuAffiliation:Cornell University,Ithaca,New York,USAemail:[ty274@cornell.edu](mailto:ty274@cornell.edu),Ruidong ZhangAffiliation:Cornell University,Ithaca,New York,USAemail:[rz379@cornell.edu](mailto:rz379@cornell.edu),Ian OakleyAffiliation:KAIST,Daejeon,Republic of Koreaemail:[ian.r.oakley@gmail.com](mailto:ian.r.oakley@gmail.com)Note:Co-corresponding authorsandCheng ZhangAffiliation:Cornell University,Ithaca,New York,USAemail:[chengzhang@cornell.edu](mailto:chengzhang@cornell.edu)2026; © cc![Refer to caption](2602.21610v1/1_teaser.png)
+
+Figure 1.Overview of WatchHand: (A) Commercial off-the-shelf smartwatch emits inaudible frequency-modulated continuous waves (FMCW) via its speaker while capturing reflected and diffracted signals from hand motion through its microphone. (B) The captured acoustic signals are preprocessed using cross-correlation to generate echo profiles—a spatiotemporal representation of signal reflections. (C) A deep-learning model then processes echo profiles to (D) continuously track 3D hand poses.Figure 1 illustrates the overall architecture of WatchHand, a system for continuous 3D hand pose tracking using only built-in sensors on a commercial smartwatch. (A) The smartwatch emits inaudible FMCW signals (18–21 kHz) and captures their reflections and diffractions caused by varying hand poses. (B) These acoustic signals are transformed into echo profiles using cross-correlation, resulting in both raw and differential representations. (C) A two-channel FastViT-based model processes the spatiotemporal echo features to regress (D) the continuous 3D positions of 20 finger joints. This pipeline demonstrates the feasibility of achieving continuous hand tracking without additional hardware or external sensors.
+###### Abstract.
+
+
+###### Keywords:
+
+Hand pose, Smartwatch, Wearable, Acoustic sensing††cc-license:by
+## 1. Introduction
+
+
+- •
+
+Hardware configuration: Commercial smartwatches typically include only a single speaker-microphone pair, often placed on opposite sides of the case (see Figure 2). It remains an open question whether a single speaker-microphone pair on COTS smartwatches can capture sufficient reflections for fine-grained hand-pose estimation. Moreover, a practical sensing system needs to support different smartwatch models, varying in microphone and speaker quality, placement, and design.
+- •
+
+Robustness to device re-wearing: When users remove and re-wear the device, small shifts in placement or orientation can alter sensor data patterns, leading to variability in tracking performance (9; 3; 17). A practical sensing system should provide reliable hand pose tracking performance even after the watch is remounted.
+- •
+
+Real-world variability: A practical sensing system must also remain robust under different wearing habits, postures, noises, and motion patterns.
+
+–
+
+Accounting for different watch-wearing hand preferences (e.g., left/right hand), which reverses the spatial orientation of the speaker and microphone.
+
+–
+
+Supporting varied body postures, such as arm-raised to view the screen or arm-resting naturally beside the body, which may affect signal reflections and thus hand pose tracking performance.
+
+–
+
+Maintaining robustness under challenging conditions such as environmental (e.g., loud music or nearby human movement) or user-induced noises (e.g., walking conditions or altered hand poses).
+
+–
+
+Covering dynamic hand pose variations, including both pose-neutral-pose (i.e., returning to a fixed neutral pose between pose changes) and direct pose-to-pose transitions, as well as varying finger movement speeds.
+- –
+
+Accounting for different watch-wearing hand preferences (e.g., left/right hand), which reverses the spatial orientation of the speaker and microphone.
+- –
+
+Supporting varied body postures, such as arm-raised to view the screen or arm-resting naturally beside the body, which may affect signal reflections and thus hand pose tracking performance.
+- –
+
+Maintaining robustness under challenging conditions such as environmental (e.g., loud music or nearby human movement) or user-induced noises (e.g., walking conditions or altered hand poses).
+- –
+
+Covering dynamic hand pose variations, including both pose-neutral-pose (i.e., returning to a fixed neutral pose between pose changes) and direct pose-to-pose transitions, as well as varying finger movement speeds.
+
+Despite many pioneering efforts, these real-world variations have not been fully addressed in prior work, yet they represent critical challenges towards building robust, generalizable, and scalable continuous 3D hand pose tracking systems that can make an immediate impact on millions of COTS smartwatches.
+
+
+- •
+
+Significantly lowering the barrier for continuous hand pose tracking on wrist-mounted devices by being the first to enable and demonstrate a continuous 3D hand pose tracking system developed exclusively using the built-in speaker and microphone on off-the-shelf smartwatches, requiring no external sensors or hardware modifications.
+- •
+
+The design and evaluation of deep learning models for hand pose estimation with multiple training strategies, including within-session, cross-session, and cross-user approaches to support broad comparisons with prior work.
+- •
+
+Extensive empirical evaluations using three widely used smartwatch brands (Samsung, Xiaomi, and Google). The promising performance exhibited across diverse scenarios (e.g., different watch models, wearing hands, body postures, noise conditions, and hand pose variation protocols) demonstrates WatchHand’s real-world feasibility. We released the dataset, comprising a total of 35.6 hours of hand pose variations captured from 40 participants across all studies, to support further research in this area.
+- •
+
+Discussion of key insights toward generalization across diverse hand poses, unseen users, and use contexts, along with practical considerations, such as power consumption, privacy, system deployment, and application designs that can support real-world adoption.
+
+
+## 2. Related Work
+
+Table 1.An overview of existing wrist-worn continuous hand pose tracking systems. The Pose-N-Pose protocol denotes returning to a neutral (default) pose between variations, while Pose to Pose signifies direct transitions between target hand poses. Cross-session evaluation refers to session-independent testing with device re-mounting([9](#bib.bib13);[19](#bib.bib6))or across different days([17](#bib.bib36)). Errors are reported in MPJPE (mm), except for * denoting MPJAE (∘).Table 1 presents a comprehensive comparison of wrist-worn systems for continuous hand pose tracking, focusing on sensing modality, number of sensors, study protocol (Pose-N-Pose vs. Pose-to-Pose), and evaluation models (within-session, cross-session, and cross-user models). WatchHand is uniquely evaluated under both protocols, demonstrating its robustness. Under the Pose-N-Pose protocol, it achieves 6.06 mm within-session, 7.87 mm cross-session, and 14.88 mm cross-user error, significantly outperforming many systems that require bulky or external hardware. Under the more challenging Pose-to-Pose protocol, it maintains competitive accuracy with 12.68 mm within-session, 15.48 mm cross-session, and 22.60 mm cross-user error, illustrating generalizability under continuous motion. Unlike prior work, WatchHand uses only a single built-in speaker, mic, and IMU on commercial off-the-shelf (COTS) smartwatches—with no added hardware—making it far more practical for deployment.
+| Related Work | Sening Modality
+(#\# of sensors) | Study Protocol
+(#\# of Ref Poses) | Within Session
+Error | Cross Session
+Error | Cross User
+Error |
+| --- | --- | --- | --- | --- | --- |
+| FingerTrak (9) | Thermal cameras (4) | Pose-N-Pose (19) | 12 mm | 27.2mm | 87 mm |
+| WR-Hand (22) | EMG sensors (8), gyro (1) | Pose-N-Pose (12) | 25.7 mm | - | 31.3 mm |
+| EchoWrist (19) | Speakers (2), mics (2) | Pose-N-Pose (15) | - | 4.81 mm | 12.2 mm |
+|  |  | Pose-N-Pose (15) | 6.06 mm | 7.87 mm | 14.88 mm |
+| WatchHand | COTS smartwatch’s
+built-in speaker (1), mic (1) | Pose to Pose (15) | 12.68 mm | 15.48 mm | 22.60 mm |
+| Digits (13) | IR camera (1), IR laser (1) | Pose to Pose (10) | 2∘ - 9∘* | - | - |
+| DiscoBand (3) | Depth cameras (8) | Pose to Pose (10) | 11.69 mm | 17.87 mm | 19.98 mm |
+| EtherPose (12) | RF antennas (2) | Pose to Pose (11) | 11.57 mm | - | - |
+| EITPose (17) | EIT electrodes (8) | Pose to Pose (12) | 11.06 mm | 17.81 mm | 18.91 mm |
+
+
+### 2.1. Active Acoustic Sensing
+
+Active acoustic sensing has emerged as a promising technique for around-device interaction by analyzing reflected or diffracted inaudible sound waves emitted from speakers to detect user gestures or movements. Early work such as SoundWave (6) leveraged Doppler shifts and a laptop’s built-in speaker and microphone to recognize mid-air gestures. Similarly, FingerIO (28) and LLAP (43) explored orthogonal frequency-division multiplexing (OFDM) or multiple continuous wave signals on customized smartwatches or commercial smartphones equipped with two pairs of microphones for precise near-device finger tracking. Building on these initial demonstrations, researchers have implemented richer acoustic sensing paradigms on various wearable devices, such as wrist-bands (19; 18; 23), smartwatches (16; 15; 50), rings (48), smart-glasses (25; 51; 24), and earbuds (37). This research has sought to enable more expressive and context-aware interaction paradigms, such as discrete gesture recognition (37; 15; 18), continuous hand pose tracking (19; 48), silent speech recognition (50; 51), and activity recognition (25).
+
+
+### 2.2. Hand Pose Input on Commercial Smartwatches
+
+Smartwatch hand pose input involves using actions of the watch-wearing hand to issue commands or respond to events. It is a compelling paradigm as it inherently enables single-handed use (5; 44; 46; 11), and rich expressivity through the high dexterity of our hands (19; 12; 7; 22; 3). However, sensing these fine-grained actions remains challenging. Prior work has predominantly focused on leveraging motion signals captured by a watch’s IMU. For example, Serendipity (44) proposed a discrete five-class hand-pose recognition system using watch motion data with an average 87% F1-score. Xu et.al.  (46) further introduced a user-adaptive method for personalizing smartwatch-based pose input that enabled detection of a more substantial set of discrete poses (e.g., 12 to 16) with up to 92.1% F1 score. Tsunoda et al.(39) detected 11 thumb-to-finger gestures with 90.2% accuracy using the watch’s accelerometer.
+
+While these results are promising, their reliability in real-world applications remains in doubt, and commercial realizations of these techniques have tended to focus on highly limited gesture sets composed of simple poses such as thumb-index pinches (1) or making a fist (29) or rely on integrating additional sensors (e.g., such as PPG (52)). We argue that the full potential of hand pose input as an expressive modality is inadequately realized by current motion sensing implementations. To fully unlock richer and expressive interactions, we need new systems that explore alternative sensing channels available on commercial devices, such as the sonar used in WatchHand.
+
+
+### 2.3. Continuous Hand Pose Tracking on Wrist Wearables
+
+Continuous hand pose tracking enables expressive, seamless, and context-aware interactions, making it a valuable modality for wearable computing. Existing approaches have explored various around-device sensing techniques integrated into wrist-worn wearables, such as camera (3; 13; 9; 45), radar (7), sound (19), RF antenna (12), proximity (5), or electromyography (EMG) (22) to track our hand movements. Camera-based methods provide high precision but face significant practical constraints. They generally require dedicated space for camera placements, restrict interaction area to the camera’s fields of view, are sensitive to lighting changes, and require a high computational cost for real-time image processing. Moreover, camera usage in wearables raises privacy concerns, particularly in public settings (20; 31). Alternative sensing modalities have thus been proposed to mitigate these issues. EtherPose (12) tracks hand poses using wrist-worn RF antennas, while WR-Hand (22) analyzes EMG signals captured from forearm muscles.
+
+Table 1 provides an overview of wrist-worn continuous 3D hand pose tracking techniques explored in related works. Based on this analysis, to the best of our knowledge, there is no existing continuous hand pose estimation system that is a viable deployment candidate for current (and likely future) smartwatch form factors. We propose WatchHand as the first solution that achieves continuous hand tracking on unmodified commercial smartwatches.
+
+
+## 3. System Design and Implementation
+
+![Refer to caption](2602.21610v1/2_watch_system.png)
+
+Figure 2.(A) Three different COTS smartwatches we evaluated and the physical locations of their built-in speaker and microphone, and (B) system evaluation setup: A smartwatch is worn on a prop hand while a stepper motor–driven linear stage moves a flat plate back and forth within typical finger movement ranges (10–15 cm). To evaluate different angles, the prop hand was rotated to various orientations (e.g., 0°, ±30°, ±60°, ±90°, and perpendicular) relative to the direction of plate motion.Figure 2-A shows the physical locations of the built-in speaker and microphone on three commercial off-the-shelf (COTS) smartwatches: Samsung Galaxy Watch 7, Xiaomi Watch Pro 2, and Google Pixel Watch 3. The speaker (blue outline) is consistently located on the left side across all models, while the microphone (red outline) varies slightly in position on the right side. These placements are critical to understanding how the system captures acoustic signals for active sensing. Figure 2-B illustrates the system evaluation setup. A smartwatch is mounted on a prop hand while a stepper motor–driven linear stage moves a flat plate back and forth within typical finger movement ranges (10–15 cm). To evaluate directional sensitivity, the prop hand is rotated to various angles (e.g., 0°, ±30°, ±60°, ±90°, and perpendicular) relative to the direction of plate motion. This setup simulates realistic 3D hand interaction scenarios for assessing echo profile variability.
+### 3.1. Design Consideration and Principle
+
+
+### 3.2. Data Collection System
+
+We implemented a sensor data capture system on three different COTS smartwatches running on WearOS: Samsung Galaxy Watch 7, Xiaomi Watch 2 Pro, and Google Pixel Watch 3. These devices feature 425 mAh, 495 mAh, and 420 mAh Li-ion batteries, respectively. All three smartwatches feature a left-side speaker and a right-side microphone when worn on the right dorsal wrist and support simultaneous 48 kHz, 16-bit PCM audio playback and recording (14). While the speaker is consistently located at the center-bottom of the left side across all three models, the microphone placement varies slightly—centered on the right side in the Galaxy Watch, and shifted slightly toward the left and bottom on the Xiaomi and Pixel watches (see Figure 2). The position will be opposite if the watch is worn on the left wrist. Different sensor positions will significantly impact the paths along which acoustic signals are reflected, a factor we explicitly explore in this paper.
+
+Our system emits FMCW signals in the inaudible range (18–21 kHz) and simultaneously captures reflected and diffracted signals from hand movements. To characterize the output levels across devices, we measured the playback sound levels using a sound level meter positioned 10 cm from the speaker. The Galaxy Watch 7 emitted 61.6 dBA, the Xiaomi Watch 2 Pro produced 66.9 dBA, and the Pixel Watch 3 emitted the highest amplitude at 80.8 dBA. To ensure consistently characterized signals across different hardware, our system records UNPROCESSED signals using the Android MediaRecorder API 11
+1
+
+
+https://developer.android.com/media/platform/mediarecorder. Additionally, we recorded 6-axis IMU data at the maximum available sampling rate on each device (Galaxy Watch: 100 Hz; Xiaomi Watch: 50 Hz; Pixel Watch: 200 Hz) to explore its potential contribution to hand pose tracking.
+
+
+### 3.3. Acoustic Data Preprocessing
+
+
+#### 3.3.1. C-FMCW Based Echo Profiles
+
+We employ airborne active acoustic sensing based on the C-FMCW approach (42). In the conventional Linear FMCW method, the theoretical distance estimation, or range-finding, resolution (RL−F​M​C​WR_{L-FMCW}) is restricted by the sweep bandwidth (BB) under the speed of sound in air (C=343​m/sC=343m/s). Using our operational bandwidth, the resolution would be 57.2 mm (=C2​B=343​m/s2×(21000−18000)=0.0572​m=\frac{C}{2B}=\frac{343m/s}{2\times(21000-18000)}=0.0572m) (36). However, by leveraging the C-FMCW technique, the effective theoretical distance estimation resolution
+(RC−F​M​C​WR_{C-FMCW}) is instead restricted by the system’s sampling rate (FsF_{s}), allowing for a substantial increase in spatial precision:
+
+
+| (1) |  | RC−F​M​C​W=C2​Fs=343​m/s2×(48000)=0.00357​m=3.57​m​mR_{C-FMCW}=\frac{C}{2F_{s}}=\frac{343m/s}{2\times(48000)}=0.00357m=3.57mm |  |
+| --- | --- | --- | --- |
+
+Algorithm 1Echo Profile Generation1:R​xRx: Raw received audio signal in the full recording(Ns​a​m​p​l​e​s,)(N_{samples},);Ns​a​m​p​l​e​sN_{samples}: The length ofR​xRx;T​xTx: Reference transmitted FMCW signal of one chirp,(L,)(L,);LL: Frame length, the samples per chirp, which is(600)(600);FsF_{s}: Sampling rate, which is(48000)(48000);[fm​i​n,fm​a​x][f_{min},f_{max}]: Bandpass frequency range, the frequency range of the transmitted signal, which is(18000,21000)(18000,21000);No​r​d​e​rN_{order}: Butterworth bandpass filter order, which is(5)(5)Nf​r​a​m​e​sN_{frames}: The number of total echo frames.2:PP: Original Echo Profiles(L,Nf​r​a​m​e​s)(L,N_{frames});Pd​i​f​fP_{diff}: Differential Echo Profiles(L,Nf​r​a​m​e​s−1)(L,N_{frames}-1)3:4:Step 1: Data Formatting and Filtering5:R​x←ButterworthBandpassFilter​(R​x,fm​i​n,fm​a​x,Fs,No​r​d​e​r)Rx\leftarrow\textsc{ButterworthBandpassFilter}(Rx,f_{min},f_{max},F_{s},N_{order})⊳\trianglerightFilter to match transmitted signal bandwidth6:7:Step 2: Start Position Detection8:C​o​r​rs​y​n​c←R​x⋆T​xCorr_{sync}\leftarrow Rx\star Tx⊳\triangleright⋆\stardenotes Cross-Correlation9:pstart←arg⁡max⁡(|C​o​r​rs​y​n​c|)p_{\text{start}}\leftarrow\arg\max(|Corr_{sync}|)⊳\trianglerightFind index of strongest correlation10:pstart←(pstart+L−⌊L/2⌋)modLp_{\text{start}}\leftarrow(p_{\text{start}}+L-\lfloor L/2\rfloor)\mod L⊳\trianglerightAdjust to frame center11:Rx←Rx[ps​t​a​r​t:,:]Rx\leftarrow Rx[p_{start}:,:]⊳\trianglerightAlign to start position,R​xRxshape:(Ns​a​m​p​l​e​s−ps​t​a​r​t,)(N_{samples}-p_{start},)12:13:Step 3: Original Echo Profile Computation14:y←R​x⋆T​xy\leftarrow Rx\star Tx⊳\triangleright⋆\stardenotes Cross-Correlation,yyshape:(Length(Rx)+L−1,)(\text{Length}(Rx)+L-1,)15:Nf​r​a​m​e​s←⌊Length​(y)/L⌋N_{frames}\leftarrow\lfloor\text{Length}(y)/L\rfloor⊳\trianglerightCalculateNf​r​a​m​e​sN_{frames}withLL16:P←Reshape​(y,[Nf​r​a​m​e​s,L])P\leftarrow\textsc{Reshape}(y,[N_{frames},L])⊳\trianglerightReshape into frames17:P←(P)TP\leftarrow(P)^{T}⊳\trianglerightTranspose to (Distance, Time),PPshape:(L,Nf​r​a​m​e​s)(L,N_{frames})18:19:Step 4: Differential Echo Profile Computation20:forframef=1f=1toNf​r​a​m​e​sN_{frames}do21:Pd​i​f​f​[f]←|P⁡[f]|−|P⁡[f−1]|P_{diff}[f]\leftarrow|P[f]|-|P[f-1]|⊳\trianglerightCalculate frame-to-frame magnitude difference22:endfor⊳\trianglerightPd​i​f​fP_{diff}shape:(L,Nf​r​a​m​e​s−1)(L,N_{frames}-1)![Visual examples of echo profile calibration across three commercial smartwatches. Sliding-window cross-correlation peak correction removes peak misalignment (red triangles), while periodic drift calibration mitigates repeating noise artifacts (red dashed boxes). Hand pose transition timings are marked (yellow triangles). Together, these calibration steps produce cleaner and more temporally stable echo profiles during dynamic hand pose transitions.](2602.21610v1/3_calibration.png)
+
+Figure 3.Visual examples of echo profile calibration across three commercial smartwatches. Sliding-window cross-correlation peak correction removes peak misalignment (red triangles), while periodic drift calibration mitigates repeating noise artifacts (red dashed boxes). Hand pose transition timings are marked (yellow triangles). Together, these calibration steps produce cleaner and more temporally stable echo profiles during dynamic hand pose transitions.Visual examples of echo profile calibration across three commercial smartwatches. Sliding-window cross-correlation peak correction removes peak misalignment (red triangles), while periodic drift calibration mitigates repeating noise artifacts (red dashed boxes). Hand pose transition timings are marked (yellow triangles). Together, these calibration steps produce cleaner and more temporally stable echo profiles during dynamic hand pose transitions.
+#### 3.3.2. Differential Echo Profiles
+
+To focus on hand reflections and reduce environmental interference, we only retain the 60 closest pixels along the vertical axis of the echo profiles, corresponding to a sensing range of 21.42 cm. This range covers the typical wrist-to-middle-fingertip distance (average male: 19.05 cm, female: 18.29 cm (38)). Along the horizontal axis, we use a 1.2-second window, which corresponds to 96 pixels.
+Altogether, combining the original and differential echo profiles, this results in two channels of 60×9660\times 96 acoustic input to our models (see Figure 1-B). The echo profiles within each window are normalized prior to being fed into the model to ensure consistency across different conditions.
+
+To enhance signal clarity and highlight salient patterns, we clip echo profiles to a threshold of ±1010\pm 10^{10} for visualization. This threshold is determined empirically to best illustrate the finger motion patterns. All visualized echo profile figures in this paper use these clipped versions, offering a clearer view of the extracted features. However, to preserve maximum information for the deep-learning model, we use the raw unclipped echo profiles during training.
+
+
+#### 3.3.3. Echo Profile Calibration for Different Watches
+
+We found that the Xiaomi and Pixel Watch exhibit more misalignment issues, while the Galaxy Watch shows more drifting issues. These device-specific inconsistencies in echo profiles can significantly degrade performance, especially when training on data pooled across different brands. Our calibration process can effectively address these issues with a universal, hardware-agnostic algorithm that corrects these misalignment and drifting issues. Importantly, all echo profiles from all devices are processed using the identical calibration process, with no per-watch or per-model specialization.
+
+
+### 3.4. IMU Motion Data Preprocessing
+
+To enhance feature extraction from IMU data while reducing noise, we adopted a data preprocessing method from prior work (46). The raw 6-axis IMU data, comprising 3 axes of accelerometer data and 3 axes of gyroscope data, yields 6 initial data channels. Each channel undergoes processing through a 2nd-order Butterworth bandpass filter with three cutoff frequency ranges: 0.22-8 Hz, 8-32 Hz, and above 32 Hz. This filtering approach separates different frequency components of the signal. By preserving the original raw data and adding these three filtered versions, each original channel expands into 4 channels. Consistent with the acoustic data processing, we employ a window of 1.2 seconds for the IMU data, and the data within each window is normalized prior to being fed into the model.
+
+![Refer to caption](2602.21610v1/4_system_angle.png)
+
+Figure 4.Captured original and differential echo profiles across different COTS smartwatches (Galaxy, Xiaomi, and Pixel) (A) and varying angles between the plate’s motion and line toward the hand (B) during repetitive back-and-forth movements toward and away from the smartwatch.Figure 4 presents captured echo profiles from different COTS smartwatches—Samsung Galaxy Watch 7, Xiaomi Watch Pro 2, and Google Pixel Watch 3—under two experimental conditions. In (A), echo profiles (both original and differential) are shown for left- and right-hand wearing configurations, illustrating consistent motion patterns across hardware and orientations. In (B), the figure shows echo profiles at varying angles (from –90° to +90°, and perpendicular) between the direction of a moving plate and the line toward the hand. These results highlight how motion direction and hand orientation influence the structure of acoustic reflections, demonstrating the system’s sensitivity to 3D movement cues.
+### 3.5. Preliminary Viability Testing on COTS Watches
+
+To demonstrate the viability of our system for 3D hand pose tracking on COTS smartwatches, we visually examined processed data to assess how hardware configurations and watch-wearing hands affect echo profiles, whether a single built-in speaker–microphone pair can reliably capture 3D around-device movement, and how echo profiles can support reliable 3D hand pose tracking.
+
+
+#### 3.5.1. Impact of hardware and watch-wearing hand
+
+
+#### 3.5.2. 3D Around-Device Movement Tracking Viability
+
+![Refer to caption](2602.21610v1/5_system_hand.png)
+
+Figure 5.Processed original and differential echo profiles (see Section[3.3](#S3.SS3)) and bandpass-filtered IMU sensor data in the 32-100 Hz range (see Section[3.4](#S3.SS4)) captured from a single user using a COTS smartwatch (Galaxy Watch 7) during different hand postures.Figure 5 shows processed original and differential echo profiles, along with bandpass-filtered IMU sensor data (32–100 Hz), for various hand postures captured from a single user wearing a COTS smartwatch (Galaxy Watch 7). Data are shown separately for left- and right-hand wearing conditions across a range of hand poses. The figure illustrates how different hand configurations produce distinct acoustic and motion signal patterns, highlighting the system’s ability to capture fine-grained variations in hand articulation.
+#### 3.5.3. 3D Hand Pose Tracking Viability
+
+
+### 3.6. Deep-Learning Pipelines
+
+![Refer to caption](2602.21610v1/11_study_setup.png)
+
+Figure 6.(A) MediapPipe-based 3D hand joint annotation used as ground truth, showing 20 labeled landmarks from the root to each fingertip. (B) Study setup in which the laptop’s front camera faces the participant’s palm to capture ground truth without optical occlusion during hand pose demonstrations.Figure 6-A shows MediapPipe-based 3D hand joint annotation used as ground truth, showing 20 labeled landmarks from the root to each fingertip. Figure 6-B illustrates Study setup in which the laptop’s front camera faces the participant’s palm to capture ground truth without optical occlusion during hand pose demonstrations.
+#### 3.6.1. Ground Truth Acquisition & Normalization
+
+
+#### 3.6.2. Deep-learning Model Framework
+
+To explore whether IMU signals could complement acoustic sensing, we extended our pipeline with a lightweight IMU encoder. Inspired by prior work on IMU-based full-body pose tracking (27), filtered motion signals (see Section 3.4) were first mapped to a 512-dimensional embedding via a linear layer, then processed using a bidirectional LSTM. The resulting features were concatenated with the acoustic features and passed through a simple fusion decoder to predict the 3D hand landmarks.
+
+
+#### 3.6.3. Training Pipeline
+
+We use three protocols to train and evaluate our models:
+
+
+- •
+
+Cross-user models: We train cross-user foundation models using data from all participants except one, whose data was reserved exclusively for the test set. This protocol simulates the deployment scenario where a system is pre-trained on large-scale datasets without access to the end user’s data.
+- •
+
+Cross-session models: User-specific models created by fine-tuning cross-user foundation models with target user data from all wearing sessions except the final session, which is reserved for testing. This protocol mimics realistic usage where users provide personalization data before regular system deployment.
+- •
+
+Within-session models: User-specific models that fine-tune cross-user foundation models using data from sessions up to the antepenultimate session plus a 50% subset from the final two sessions. The remaining 50% of data from the final two sessions serves as the test set. This protocol evaluates system performance when users collect calibration data after watch remounting, simulating scenarios where brief personalization occurs with every device repositioning.
+
+
+#### 3.6.4. Data Augmentation
+
+
+## 4. Study 1: Continuous Hand Pose Tracking
+
+We conducted a study to evaluate the continuous 3D hand pose tracking performance of WatchHand across three different COTS smartwatches and different watch-wearing hands. This study was approved by the local Institutional Review Board (IRB).
+
+
+### 4.1. Participants
+
+We recruited 24 participants (12 males, a mean age of 22.5 (SD 2.3)) from the local university. 23 participants were right-handed. While most participants reported wearing a smartwatch on their non-dominant hand, two right-handed participants preferred wearing it on their dominant hand for reasons such as easier access to notifications or increased comfort. Participants’ hand sizes averaged 17.95 cm (SD 0.95) in length (from the base of the hand to the tip of the middle finger) and 7.88 cm (SD 0.53) in palm width. The study took approximately two hours to complete, and participants were compensated with 30 USD in local currency.
+
+
+### 4.2. Study Design
+
+
+### 4.3. Study Procedure
+
+
+## 5. Results
+
+We recorded a total of 1152 minutes of gesture data from 24 participants, consisting of 192 minutes for each of the six combinations of two independent factors: three smartwatch models and two wearing hands. During the study, while some participants at times performed incorrect gestures due to physical constraints or loss of focus, we included all recorded data, as our ground truth capture system reliably tracks the actual gestures performed, and our interest lies in continuous hand pose tracking. These natural variations enrich the dataset’s diversity and contribute to the development of models that are more robust to continuous and unconstrained hand pose tracking scenarios.
+
+As detailed in Section 3.6.3, we implemented and evaluated cross-session, within-session, and cross-user models, following a two-phase training pipeline. In this analysis, as all the results were normally distributed and met the upheld-sphericity assumptions, we conducted two-way ANOVAs on both metrics with different watch hardware and watch-wearing hand as independent variables.
+
+![Refer to caption](2602.21610v1/7_study1_result.png)
+
+Figure 7.Hand pose tracking performance in Study 1: (A) average 3D hand reconstruction errors in cross-session evaluation for each finger in both MPJPE and MPJAE metrics, and (B) average hand pose tracking performance across all evaluation models and metrics.Figure 7 provides a detailed performance analysis of WatchHand’s 3D hand pose tracking system. (A) breaks down cross-session tracking errors by finger, showing that the middle and ring fingers exhibit the highest MPJPE and MPJAE due to their anatomical proximity and occlusion, while the little and index fingers perform best. (B) compares overall tracking performance across within-session, cross-session, and cross-user evaluations, revealing a clear degradation trend as generalization increases. Despite this, WatchHand maintains low MPJPE (7.86 mm), MPJAE (6.06°), and MWAE (7.19°) in cross-session scenarios, confirming its robustness for real-world deployment with session and user variability.
+### 5.1. Cross-Session Model
+
+
+#### 5.1.1. Continuous Fine-Grained Finger Movements
+
+
+#### 5.1.2. Continuous Wrist Rotation
+
+Next, we evaluated our system’s wrist-rotation tracking performance using the mean wrist angle error (MWAE) metric. The acoustic model demonstrated high accuracy in wrist-rotation tracking, achieving an average MWAE of 7.19∘ (SD 2.26). Similar to the results for fine-grained finger movement tracking, no significant main effects or interactions were observed (F-values 0.12-2.37, p-values 0.11-0.73).
+
+
+#### 5.1.3. Multimodal Model Result
+
+
+### 5.2. Within-Session Model
+
+To enable full comparison with prior work, we further evaluated WatchHand using a within-session model. It achieved an average MPJPE of 6.02 mm (SD 1.04), MPJAE of 4.63∘ (SD 0.80), and MWAE of 5.70∘ (SD 2.07). Similar to the cross-session model, performance showed no significant effects of hardware or watch-wearing hand (F-values 0.004-1.51, p-values 0.27-0.95). The hand pose tracking performances are notably better than those from the cross-session model (see Figure 7-B). These results align with prior works showing that within-session testing benefits from stable device placement and minimized variability (9; 3; 17). While this protocol represents a somewhat unrealistic best-case scenario with highly stable device placement, it does provide a useful benchmark against prior systems that have followed similar procedures and serves to underscore the effectiveness of WatchHand’s acoustic pipeline.
+
+
+### 5.3. Cross-User Model
+
+
+## 6. Study 2: Adaptation to Diverse Body Postures
+
+Given the positive hand pose tracking accuracy observed in sitting posture during Study 1, we further conducted a follow-up study to evaluate performance across more diverse postures. Specifically, we examined two common standing postures, including a watch-raised pose and an arm-resting pose (Figure 8-A). This study was approved by the local IRB.
+
+![Refer to caption](2602.21610v1/8_study2_result.png)
+
+Figure 8.(A) Three key postures covered in this work: sitting and arm-raised pose, and watch-raised pose, where the arm is naturally positioned horizontally in front of the body to view the watch screen, and arm-resting, with the arm lowered in a relaxed position adjacent to the thigh. (B) Average hand pose tracking performances from standing postures (including both watch-raised and arm-resting poses) for each fine-tuning condition—without (trained with data captured from the sitting poses), 1-session, and 9-session, reported across all metrics.Figure 8-A illustrates the three key postures evaluated in this work: (A) sitting with an arm-raised pose from the first study, (B) watch-raised pose where the arm is held horizontally in front of the body to view the watch, and (C) arm-resting pose with the arm relaxed beside the thigh. Postures (B) and (C) were assessed in the second study to examine the system’s robustness under natural variations in arm position. Figure 8-B shows the average hand pose tracking performance from standing postures (including both watch-raised and arm-resting poses) across three fine-tuning conditions: without fine-tuning, with 1-session fine-tuning, and with 9-session fine-tuning. Results across all metrics (MPJPE, MPJAE, MWAE) demonstrate that performance improves as more fine-tuning data is used, highlighting the benefit of adaptation for enhancing model accuracy in varied postural contexts.
+### 6.1. Participants
+
+We re-invited six participants (three males, a mean age of 22.17 (SD 2.86), all right-handed) from the first study, sampled opportunistically according to their availability. Each participant wore the same smartwatch model they had previously used (3 Xiaomi Watch, 2 Google Pixel Watch, and 1 Samsung Galaxy Watch) on their non-dominant hand. This study lasted approximately two hours, and each participant was compensated with 30 USD in local currency.
+
+
+### 6.2. Study Design and Procedure
+
+We conducted 20 standing sessions—including 10 in the watch-raised pose and 10 in the arm-resting pose, following the same protocol as in Study 1, which included 18 gestures with four repetitions for each session—to evaluate robustness to variations in posture, addressing: Can our system track hand poses when users are in different body postures? For the collection of ground-truth data, we used an external webcam positioned below for the watch-raised pose and to the side for the arm-resting pose, with camera angles facing the palm to get the full finger joint ground truth.
+
+
+### 6.3. Results
+
+We collected a total of 288 minutes of data from 6 participants, including 144 minutes from the two postures: watch-raised and arm-resting. Following the first study, we evaluated the system performance on two subsets: (1) continuous fine-grained finger movement tracking using MPJPE and MPJAE metrics, and (2) gross wrist rotation using the MWAE metric. To evaluate WatchHand’s robustness across varying body postures, we conducted a targeted analysis across three distinct conditions: (1) posture-independent model, (2) single-session fine-tuned model, and (3) nine-session fine-tuned model. The data collected for the two new postures—watch-raised and arm-resting—were analyzed separately throughout this evaluation. Given the small sample size, we focused on comparing the numerical values rather than formal statistical analysis.
+
+
+## 7. Study 3: Robustness to Noises
+
+We further evaluated WatchHand under various noise conditions, reflecting common real-world usage where acoustic signals may be disturbed by external sounds and motion. This study was approved by the local IRB.
+
+
+### 7.1. Participants
+
+We recruited 8 participants (5 male, mean age 23.88, SD 4.39) from a local university, matching the number of participants who used a single smartwatch in Study 1. Their mean hand length was 18.18 cm (SD 1.21), and their mean palm width was 8.04 cm (SD 0.62). Each session lasted two hours, and participants received 30 USD in local currency for compensation.
+
+![Figure 9 illustrates Four noise and interference conditions used in Study 3. (A) shows loud music condition, where high-volume audio played near the participant, (B) shows nearby human interference condition, where another person walking around the participant within 1 m, (C) illustrates participant walking in place while executing pose transitions, and (D) shows participants intentionally performing modified gestures (e.g., reduced or increased finger spacing) to simulate natural inconsistencies.](2602.21610v1/10_noise_setup.png)
+
+Figure 9.Four noise and interference conditions used in Study 3: (A) high-volume audio played near the participant, (B) another person walking around the participant within 1 m, (C) participant walking in place while executing pose transitions, and (D) participants intentionally performing modified gestures (e.g., reduced or increased finger spacing) to simulate natural inconsistencies.Figure 9 illustrates Four noise and interference conditions used in Study 3. (A) shows loud music condition, where high-volume audio played near the participant, (B) shows nearby human interference condition, where another person walking around the participant within 1 m, (C) illustrates participant walking in place while executing pose transitions, and (D) shows participants intentionally performing modified gestures (e.g., reduced or increased finger spacing) to simulate natural inconsistencies.
+### 7.2. Study Design and Procedures
+
+![Figure 10 shows average hand pose tracking performances across all metrics, (A) shows bar plot which comparing baseline (no noise) to four noisy conditions, including loud music, nearby movement, walking, and altered poses, and (B) shows comparing baseline to average performance across the noisy conditions with and without one-session fine-tuning.](2602.21610v1/13_study4_result.png)
+
+Figure 10.Average hand pose tracking performances across all metrics, comparing baseline (no noise) to (A) four noisy conditions—loud music, nearby movement, walking, and altered poses, and (B) average performance across the noisy conditions with and without one-session fine-tuning.Figure 10 shows average hand pose tracking performances across all metrics, (A) shows bar plot which comparing baseline (no noise) to four noisy conditions, including loud music, nearby movement, walking, and altered poses, and (B) shows comparing baseline to average performance across the noisy conditions with and without one-session fine-tuning.
+### 7.3. Results
+
+We collected a total of 345.6 minutes of data from 8 participants, consisting of 192 minutes from the sitting condition and 38.4 minutes for each of the four noise/interference scenarios. In this study, we report three sets of results: 1. Baseline: training on 9 sessions and testing on the remaining session under the sitting condition; 2. Cross-condition: evaluating the same trained model directly on each of the four noise conditions; 3. One-session fine-tuning: adapting the model with one session (2 minutes of data for finger movements; 0.4 minutes of data for wrist rotation, following Study 2) from each noise condition and testing on the other session. All evaluations were conducted under a cross-session protocol to reflect realistic real-world usage.
+
+
+## 8. Study 4: Evaluation on Dynamic Hand Pose Variations
+
+![Refer to caption](2602.21610v1/9_study3_result.png)
+
+Figure 11.Average hand pose tracking performance in Study 4 across (A) evaluation protocols and (B) hand pose transition speeds.Figure 11 compares WatchHand’s hand pose tracking performance across evaluation protocols and pose variation speeds. (A) shows that cross-user evaluation yields the highest MPJPE (22.6 mm) and MPJAE (14.49°), reflecting inter-user variability, while within-session results are lowest (12.68 mm / 10.96°), confirming model reliability under stable conditions. (B) evaluates system robustness under different hand motion speeds. While performance degrades modestly for both faster (15.61 mm / 13.82°) and slower (17.04 mm / 15.23°) transitions, the system maintains bounded accuracy, indicating resilience to temporal variation.
+### 8.1. Participants
+
+We recruited 8 participants (4 male, all right-handed, mean age 23.5, SD 4.17) from a local university. Their mean hand length was 18.46 cm (SD 1.94), and their mean palm width was 7.99 cm (SD 0.94). Each session lasted approximately 90 minutes, and participants received a 25 USD voucher for their participation.
+
+
+### 8.2. Study Design
+
+We evaluated the same set of 15 hand gestures as in Study 1, consisting of 5 simple and 10 complex gestures. Wrist orientation gestures were excluded due to their limited pose-to-pose variation (only 6 combinations). Each session included diverse pose-to-pose transitions, including 4 repetitions of both simple and complex gestures, each lasting two seconds, presented in a randomized order, consistent with the Study 1 protocol. Participants completed 20 sessions at a normal transition speed (two seconds per pose change). To further assess robustness, each participant completed an additional session in both fast (1.5 s transition) and slow (2.5 s transition) conditions.
+
+
+### 8.3. Study Procedure
+
+This study followed a procedure similar to that of Study 1, including obtaining consent, donning equipment, delivering instructions, conducting practice trials, executing the main task, and completing a demographic questionnaire. Before beginning the experimental sessions, participants completed a practice trial. They then performed 20 normal-speed sessions, followed by one session each under fast and slow conditions. In the fast and slow conditions, participants were instructed to adjust their hand pose transition times to 1.5 s (fast) or 2.5 s (slow), following protocols in prior work (19). Considering practical and realistic variability, participants removed and re-wore the smartwatch between sessions.
+
+
+### 8.4. Results
+
+We collected a total of 352 minutes of data from 8 participants. This dataset includes 320 minutes of normal-speed sessions and additional test sessions at varying speeds and styles: 12 minutes of fast, 20 minutes of slow conditions. One participant (P28) exhibited a noticeable hand tremor when attempting to bend only the middle finger. To prevent muscle strain and ensure consistent data, we instructed him to stabilize the middle finger with his thumb (e.g., in ASL-8). We processed the captured data and implemented the acoustic model using the same procedures outlined in Study 1. Below, we report results under three evaluation protocols to provide a comprehensive view of WatchHand’s continuous 3D hand pose performances in pose-to-pose variation.
+
+We first evaluated WatchHand under a cross-session protocol, where the participants re-wore the device across different sessions, reflecting realistic everyday use. In this result, the model achieved an average MPJPE of 15.48 mm (SD 2.75) and an MPJAE of 13.61∘ (SD 2.18). Next, we evaluated WatchHand under a within-session protocol—as an upper-bound performance benchmark—since device placement and environmental factors remain constant. In this result, the model achieved an average MPJPE of 12.68 mm (SD 2.63) and an MPJAE of 10.96∘ (SD 1.72). Finally, we performed a cross-user evaluation, where models were trained on data from all other participants and tested on unseen participants, providing the system’s generalizability to new users. In this result, the model achieved an average MPJPE of 22.60 mm (SD 5.18) and an MPJAE of 14.49∘ (SD 1.12). Overall, these results show consistent tendencies with Study 1 across protocols: strongest performance in within-session settings, moderate error increases in cross-session evaluation, and the largest drop in cross-user testing (see Figure 11-A)—patterns consistent with prior work (3; 9; 17).
+
+![Figure 12 presents the fifteen hand poses used in the study for fine-grained finger movement tracking. The top row shows the instructed reference images for each pose, including finger-specific bends and ASL number gestures (ASL-0 to ASL-9). The middle and bottom row displays the corresponding hand pose predictions from the WatchHand deep-learning model, demonstrating close alignment with the reference image. They are visualized with MANO from the pose-neutral-pose cross-session model in Study 1 at middle row, and pose-to-pose cross-session model in Study 4 at bottom row.](2602.21610v1/14_qualitative_result.png)
+
+Figure 12.Hand poses instructed in the studies (top row) and example predictions (visualized with MANO([32](#bib.bib38))) from the pose-neutral-pose cross-session model in Study 1 (middle row) and pose-to-pose cross-session model in Study 4 (bottom row).Figure 12 presents the fifteen hand poses used in the study for fine-grained finger movement tracking. The top row shows the instructed reference images for each pose, including finger-specific bends and ASL number gestures (ASL-0 to ASL-9). The middle and bottom row displays the corresponding hand pose predictions from the WatchHand deep-learning model, demonstrating close alignment with the reference image. They are visualized with MANO from the pose-neutral-pose cross-session model in Study 1 at middle row, and pose-to-pose cross-session model in Study 4 at bottom row.
+## 9. Discussion and Limitation
+
+Our studies confirm the encouraging performance of WatchHand for inferring continuous 3D hand poses across three common COTS smartwatches. Because it operates entirely with built-in hardware and does not require bespoke sensors, WatchHand has strong potential to immediately expand the interaction capabilities of COTS smartwatches. The results also suggest its applicability across diverse scenarios, including more complex hand poses, different smartwatch models, watch-wearing hands, body postures, and noise conditions. In this section, we further discuss the opportunities and challenges of deploying WatchHand more broadly across diverse hand poses and use contexts to support everyday use in the future.
+
+
+### 9.1. Generalizing to Diverse Hand Poses, Users, and Contexts
+
+![Refer to caption](2602.21610v1/12_object_interference.png)
+
+Figure 13.Impact of hand–object interaction on acoustic hand pose tracking. (A) Echo profiles of a holding gesture performed without an object and (B) with a cup. Each sequence consists of four phases: Reach, Hold, Release, and Depart. Compared to the object-free condition, performing the gesture while holding an object produces noticeable acoustic interference near the smartwatches.\par
+#### 9.1.1. Dynamic Hand Pose Variation
+
+We evaluated WatchHand under two hand pose variation protocols: pose-neutral-pose (returning to a neutral hand pose between pose variations) in Studies 1-3 and pose-to-pose (direct transitions between poses) in Study 4. The latter introduces richer intermediate states and greater temporal variability, which, as expected, led to a modest accuracy drop (96.7% increase in MPJPE in cross-session evaluation) relative to pose-neutral-pose. However, this drop must be understood in the context of the greatly increased complexity of the task: the number of possible pose transitions increased by 8.3 times (from 15 to 125). Despite this more challenging setting, WatchHand outperforms prior pose-to-pose systems (e.g., DiscoBand (3) (17.87 mm) and EITPose (17) (17.81 mm)) in cross-session evaluation, demonstrating its robustness and the feasibility of scaling continuous hand pose tracking to real-world smartwatch use.
+
+
+#### 9.1.2. Unseen Hand Poses
+
+
+#### 9.1.3. Unseen Users
+
+Cross-user evaluation yielded encouraging results, with MPJPE ranging from 15 to 23 mm across both pose-neutral-pose and pose-to-pose protocols. Performance degradation was primarily due to inter-individual differences in hand size and articulation, which introduced greater variability in pose execution. This pattern is consistent with prior wrist-worn hand-pose tracking systems, where cross-user performance is substantially weaker than within-session (3; 17) or cross-session results (19; 9). These findings underscore a key challenge of cross-user generalization: while the system adapts well within a user, accommodating inter-individual differences remains challenging. Addressing this will require larger and more heterogeneous datasets spanning a wider range of users and hand characteristics, and meta-learning–style adaptation could further improve cross-user robustness.
+
+
+#### 9.1.4. Robustness to Noise
+
+
+#### 9.1.5. Holding Object Interferences
+
+
+#### 9.1.6. Strategies for Improving and Enriching Datasets
+
+
+### 9.2. Toward Real-World Implementation
+
+
+#### 9.2.1. Bespoke Hardware vs Off-the-shelf Smartwatches
+
+
+#### 9.2.2. Hardware Configuration and Watch-wearing Hands
+
+
+#### 9.2.3. System Deployment
+
+In this study, as in many prior works (19; 48; 12; 3; 17; 22; 9), our system initially streamed the raw sensor data from the smartwatch to external servers (e.g., laptop or smartphone), with signal processing and model inference performed on a remote server. However, to be deployed in real-world settings, the system needs to run entirely on-device without relying on external infrastructure. To demonstrate the feasibility of this, we deployed the entire pipeline model—including signal processing and model inference—on commercial smartwatches. The model (26.7 MB) executes fully on-device (tested on Samsung Galaxy Watch 7), enabling real-time, continuous hand pose tracking without transmitting data to external systems. The average latency per prediction is 0.115s (SD 0.006), comprising 0.035s (SD 0.004) for preprocessing and 0.08s (SD 0.005) for inference, supporting responsive interaction in practical use.
+
+
+### 9.3. Practical Consideration
+
+
+#### 9.3.1. Power Consumption
+
+
+#### 9.3.2. Privacy
+
+
+#### 9.3.3. Potential Applications
+
+
+## 10. Conclusion
+
+
+###### Acknowledgements.
+
+We thank all the participants who took part in our user studies. This work was supported by the National Science Foundation under Grant No.2239569 (NSF CAREER Award) and the IITP(Institute of Information & Communications Technology Planning & Evaluation)-ITRC(Information Technology Research Center) grant funded by the Korea government(Ministry of Science and ICT)(IITP-2026-RS-2024-00436398).
+## References
+
+
+- Apple (2024)
+Apple
+
+Use AssistiveTouch on your Apple Watch.
+
+Note: https://support.apple.com/guide/watch/assistivetouch-apdec70bfd2d/watchos
+
+Cited by: §2.2,
+§9.3.1.
+- Arakawa et al. (2024)
+R. Arakawa, H. Yakura, and M. Goel
+
+PrISM-observer: intervention agent to help users perform everyday procedures sensed using a smartwatch.
+
+In Proceedings of the 37th Annual ACM Symposium on User Interface Software and Technology,
+
+UIST ’24, New York, NY, USA.
+
+External Links: ISBN 9798400706288,
+Link,
+Document
+
+Cited by: §9.3.3.
+- Devrio and Harrison (2022)
+N. Devrio and C. Harrison
+
+DiscoBand: multiview depth-sensing smartwatch strap for hand, body and environment tracking.
+
+In Proceedings of the 35th Annual ACM Symposium on User Interface Software and Technology,
+
+UIST ’22, New York, NY, USA.
+
+External Links: ISBN 9781450393201,
+Link,
+Document
+
+Cited by: 2nd item,
+§1,
+§2.2,
+§2.3,
+§2.3,
+Table 1,
+§3.6.1,
+§5.2,
+§5.3,
+§8.4,
+§9.1.1,
+§9.1.3,
+§9.1.6,
+§9.2.3.
+- DeVrio et al. (2023)
+N. DeVrio, V. Mollyn, and C. Harrison
+
+SmartPoser: arm pose estimation with a smartphone and smartwatch using uwb and imu data.
+
+In Proceedings of the 36th Annual ACM Symposium on User Interface Software and Technology,
+
+UIST ’23, New York, NY, USA.
+
+External Links: ISBN 9798400701320,
+Link,
+Document
+
+Cited by: §9.3.3.
+- Gong et al. (2018)
+J. Gong, Z. Xu, Q. Guo, T. Seyed, X. ’. Chen, X. Bi, and X. Yang
+
+WrisText: one-handed text entry on smartwatch using wrist gestures.
+
+In Proceedings of the 2018 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’18, New York, NY, USA, pp. 1–14.
+
+External Links: ISBN 9781450356206,
+Link,
+Document
+
+Cited by: §2.2,
+§2.3.
+- Gupta et al. (2012)
+S. Gupta, D. Morris, S. Patel, and D. Tan
+
+SoundWave: using the doppler effect to sense gestures.
+
+In Proceedings of the SIGCHI Conference on Human Factors in Computing Systems,
+
+CHI ’12, New York, NY, USA, pp. 1911–1914.
+
+External Links: ISBN 9781450310154,
+Link,
+Document
+
+Cited by: §2.1.
+- Hajika et al. (2024)
+R. Hajika, T. S. Gunasekaran, C. D. S. Y. Haigh, Y. S. Pai, E. Hayashi, J. Lien, D. Lottridge, and M. Billinghurst
+
+RadarHand: a wrist-worn radar for on-skin touch-based proprioceptive gestures.
+
+ACM Trans. Comput.-Hum. Interact. 31 (2).
+
+External Links: ISSN 1073-0516,
+Link,
+Document
+
+Cited by: §1,
+§2.2,
+§2.3,
+§2.3.
+- He et al. (2016)
+K. He, X. Zhang, S. Ren, and J. Sun
+
+Deep residual learning for image recognition.
+
+In Proceedings of the IEEE conference on computer vision and pattern recognition,
+
+pp. 770–778.
+
+Cited by: §3.6.2.
+- Hu et al. (2020)
+F. Hu, P. He, S. Xu, Y. Li, and C. Zhang
+
+FingerTrak: continuous 3d hand pose tracking by deep learning hand silhouettes captured by miniature thermal cameras on wrist.
+
+Proc. ACM Interact. Mob. Wearable Ubiquitous Technol. 4 (2).
+
+External Links: Link,
+Document
+
+Cited by: 2nd item,
+§1,
+§2.3,
+§2.3,
+Table 1,
+Table 1,
+§5.2,
+§5.3,
+§8.4,
+§9.1.3,
+§9.1.6,
+§9.2.3.
+- Jimenez-Olmedo et al. (2019)
+J. M. Jimenez-Olmedo, A. Penichet-Tomás, M. O. Becerra, B. Pueo, and J. J. Espina-Agullo
+
+Relationships between anthropometric parameters and overarm throw in elite beach handball.
+
+Human Movement 20 (2), pp. 16–24.
+
+Cited by: §8.4.
+- Kaifosh and Reardon (2025)
+P. Kaifosh and T. R. Reardon
+
+A generic non-invasive neuromotor interface for human-computer interaction.
+
+Nature, pp. 1–10.
+
+Cited by: §1,
+§2.2.
+- Kim and Harrison (2022)
+D. Kim and C. Harrison
+
+EtherPose: continuous hand pose tracking with wrist-worn antenna impedance characteristic sensing.
+
+In Proceedings of the 35th Annual ACM Symposium on User Interface Software and Technology,
+
+UIST ’22, New York, NY, USA.
+
+External Links: ISBN 9781450393201,
+Link,
+Document
+
+Cited by: §1,
+§2.2,
+§2.3,
+§2.3,
+Table 1,
+§3.6.1,
+§5,
+§9.1.6,
+§9.2.3.
+- Kim et al. (2012)
+D. Kim, O. Hilliges, S. Izadi, A. D. Butler, J. Chen, I. Oikonomidis, and P. Olivier
+
+Digits: freehand 3d interactions anywhere using a wrist-worn gloveless sensor.
+
+In Proceedings of the 25th Annual ACM Symposium on User Interface Software and Technology,
+
+UIST ’12, New York, NY, USA, pp. 167–176.
+
+External Links: ISBN 9781450315807,
+Link,
+Document
+
+Cited by: §1,
+§2.3,
+Table 1,
+§5.3.
+- Kim et al. (2026)
+J. Kim, H. Jung, and I. Oakley
+
+OpenAcoustics: an open-source framework for acoustic data capture on smart devices and microcontrollers.
+
+In Companion of the 2025 ACM International Joint Conference on Pervasive and Ubiquitous Computing,
+
+UbiComp Companion ’25, New York, NY, USA, pp. 662–664.
+
+External Links: ISBN 9798400714771,
+Link,
+Document
+
+Cited by: §3.2.
+- Kim and Oakley (2022)
+J. Kim and I. Oakley
+
+SonarID: using sonar to identify fingers on a smartwatch.
+
+In Proceedings of the 2022 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’22, New York, NY, USA.
+
+External Links: ISBN 9781450391573,
+Link,
+Document
+
+Cited by: §1,
+§2.1,
+§3.5.2.
+- Kim et al. (2025)
+J. Kim, J. Son, and I. Oakley
+
+Cross, dwell, or pinch: designing and evaluating around-device selection methods for unmodified smartwatches.
+
+In Proceedings of the 2025 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’25, New York, NY, USA.
+
+External Links: ISBN 9798400713941,
+Link,
+Document
+
+Cited by: §2.1,
+§3.5.2.
+- Kyu et al. (2024)
+A. Kyu, H. Mao, J. Zhu, M. Goel, and K. Ahuja
+
+EITPose: wearable and practical electrical impedance tomography for continuous hand pose estimation.
+
+In Proceedings of the 2024 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’24, New York, NY, USA.
+
+External Links: ISBN 9798400703300,
+Link,
+Document
+
+Cited by: 2nd item,
+§1,
+§2.3,
+Table 1,
+Table 1,
+§5.2,
+§5.3,
+§8.4,
+§9.1.1,
+§9.1.3,
+§9.1.6,
+§9.2.3.
+- Lee et al. (2025)
+C. Lee, J. Li, T. C. Yu, R. Zhang, V. Gunda, F. Guimbretière, and C. Zhang
+
+Grab-n-go: on-the-go microgesture recognition with objects in hand.
+
+arXiv preprint arXiv:2508.11620.
+
+Cited by: §2.1,
+§3.6.2,
+§9.1.5.
+- Lee et al. (2024)
+C. Lee, R. Zhang, D. Agarwal, T. C. Yu, V. Gunda, O. Lopez, J. Kim, S. Yin, B. Dong, K. Li, M. Sakashita, F. Guimbretiere, and C. Zhang
+
+EchoWrist: continuous hand pose tracking and hand-object interaction recognition using low-power active acoustic sensing on a wristband.
+
+In Proceedings of the 2024 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’24, New York, NY, USA.
+
+External Links: ISBN 9798400703300,
+Link,
+Document
+
+Cited by: §1,
+§1,
+§1,
+§2.1,
+§2.1,
+§2.2,
+§2.3,
+§2.3,
+Table 1,
+Table 1,
+§3.1,
+§3.1,
+§3.6.1,
+§3.6.2,
+§4.2,
+§5.1.3,
+§5.3,
+§5,
+§8.3,
+§8,
+§9.1.3,
+§9.1.6,
+§9.2.1,
+§9.2.3,
+§9.3.1.
+- Lehman et al. (2022)
+S. M. Lehman, A. S. Alrumayh, K. Kolhe, H. Ling, and C. C. Tan
+
+Hidden in plain sight: exploring privacy risks of mobile augmented reality applications.
+
+ACM Trans. Priv. Secur. 25 (4).
+
+External Links: ISSN 2471-2566,
+Link,
+Document
+
+Cited by: §2.3.
+- Lim et al. (2025)
+H. Lim, N. A. Dang, D. Lee, T. C. Yu, J. Lu, F. M. Li, Y. Jin, Y. Ma, X. Bi, F. Guimbretière, et al.
+
+SpellRing: recognizing continuous fingerspelling in american sign language using a ring.
+
+arXiv preprint arXiv:2502.10830.
+
+Cited by: §1,
+§9.3.3.
+- Liu et al. (2021)
+Y. Liu, C. Lin, and Z. Li
+
+WR-hand: wearable armband can track user’s hand.
+
+Proc. ACM Interact. Mob. Wearable Ubiquitous Technol. 5 (3).
+
+External Links: Link,
+Document
+
+Cited by: §1,
+§2.2,
+§2.3,
+§2.3,
+Table 1,
+§9.2.3.
+- Mahmoodi et al. (2025)
+K. Mahmoodi, Y. Xie, T. Gemicioglu, C. Lee, J. Kim, and C. Zhang
+
+EchoForce: continuous grip force estimation from skin deformation using active acoustic sensing on a wristband.
+
+In Proceedings of the 2025 ACM International Symposium on Wearable Computers,
+
+ISWC ’25, New York, NY, USA, pp. 53–60.
+
+External Links: ISBN 9798400714818,
+Link,
+Document
+
+Cited by: §2.1.
+- Mahmud et al. (2023)
+S. Mahmud, K. Li, G. Hu, H. Chen, R. Jin, R. Zhang, F. Guimbretière, and C. Zhang
+
+PoseSonic: 3d upper body pose estimation through egocentric acoustic sensing on smartglasses.
+
+Proc. ACM Interact. Mob. Wearable Ubiquitous Technol. 7 (3).
+
+External Links: Link,
+Document
+
+Cited by: §2.1.
+- Mahmud et al. (2024)
+S. Mahmud, V. Parikh, Q. Liang, K. Li, R. Zhang, A. Ajit, V. Gunda, D. Agarwal, F. Guimbretiere, and C. Zhang
+
+ActSonic: recognizing everyday activities from inaudible acoustic wave around the body.
+
+Proc. ACM Interact. Mob. Wearable Ubiquitous Technol. 8 (4).
+
+External Links: Link,
+Document
+
+Cited by: §2.1,
+§2.1.
+- Meta (2025)
+Meta
+
+Hands best practices.
+
+External Links: Link
+
+Cited by: §9.1.5.
+- Mollyn et al. (2023)
+V. Mollyn, R. Arakawa, M. Goel, C. Harrison, and K. Ahuja
+
+IMUPoser: full-body pose estimation using imus in phones, watches, and earbuds.
+
+In Proceedings of the 2023 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’23, New York, NY, USA.
+
+External Links: ISBN 9781450394215,
+Link,
+Document
+
+Cited by: §3.6.2.
+- Nandakumar et al. (2016)
+R. Nandakumar, V. Iyer, D. Tan, and S. Gollakota
+
+FingerIO: using active sonar for fine-grained finger tracking.
+
+In Proceedings of the 2016 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’16, New York, NY, USA, pp. 1515–1525.
+
+External Links: ISBN 9781450333627,
+Link,
+Document
+
+Cited by: §1,
+§2.1,
+§2.1.
+- Newsroom (2023)
+S. Newsroom
+
+More Than a Gesture: How Galaxy Watch’s Universal Gestures Feature Enhances Accessibility.
+
+Note: https://news.samsung.com/global/more-than-a-gesture-how-galaxy-watchs-universal-gestures-feature-enhances-accessibility
+
+Cited by: §2.2,
+§9.3.1.
+- Pugeault and Bowden (2011)
+N. Pugeault and R. Bowden
+
+Spelling it out: real-time asl fingerspelling recognition.
+
+In 2011 IEEE International Conference on Computer Vision Workshops (ICCV Workshops),
+
+Vol. , pp. 1114–1119.
+
+External Links: Document
+
+Cited by: §1,
+§9.3.3.
+- Roesner et al. (2014)
+F. Roesner, T. Kohno, and D. Molnar
+
+Security and privacy for augmented reality systems.
+
+Commun. ACM 57 (4), pp. 88–96.
+
+External Links: ISSN 0001-0782,
+Link,
+Document
+
+Cited by: §2.3.
+- Romero et al. (2017)
+J. Romero, D. Tzionas, and M. J. Black
+
+Embodied hands: modeling and capturing hands and bodies together.
+
+ACM Trans. Graph. 36 (6).
+
+External Links: ISSN 0730-0301,
+Link,
+Document
+
+Cited by: §3.6.2,
+Figure 12.
+- Salter et al. (2024)
+S. Salter, R. Warren, C. Schlager, A. Spurr, S. Han, R. Bhasin, Y. Cai, P. Walkington, A. Bolarinwa, R. J. Wang, et al.
+
+Emg2pose: a large and diverse benchmark for surface electromyographic hand pose estimation.
+
+Advances in Neural Information Processing Systems 37, pp. 55703–55728.
+
+Cited by: §9.3.3.
+- Sharma et al. (2024)
+A. Sharma, A. Ivanov, F. Lai, T. Grossman, and S. Santosa
+
+GraspUI: seamlessly integrating object-centric gestures within the seven phases of grasping.
+
+In Proceedings of the 2024 ACM Designing Interactive Systems Conference,
+
+DIS ’24, New York, NY, USA, pp. 1275–1289.
+
+External Links: ISBN 9798400705830,
+Link,
+Document
+
+Cited by: §9.1.5.
+- Sharma et al. (2023)
+A. Sharma, C. Salchow-Hömmen, V. S. Mollyn, A. S. Nittala, M. A. Hedderich, M. Koelle, T. Seel, and J. Steimle
+
+SparseIMU: computational design of sparse imu layouts for sensing fine-grained finger microgestures.
+
+ACM Trans. Comput.-Hum. Interact. 30 (3).
+
+External Links: ISSN 1073-0516,
+Link,
+Document
+
+Cited by: §9.3.3.
+- Stove (1992)
+A. G. Stove
+
+Linear fmcw radar techniques.
+
+In IEE Proceedings F (Radar and Signal Processing),
+
+Vol. 139, pp. 343–350.
+
+Cited by: §3.3.1.
+- Suzuki et al. (2024)
+S. Suzuki, T. Amesaka, H. Watanabe, B. Shizuki, and Y. Sugiura
+
+EarHover: mid-air gesture recognition for hearables using sound leakage signals.
+
+In Proceedings of the 37th Annual ACM Symposium on User Interface Software and Technology,
+
+UIST ’24, New York, NY, USA.
+
+External Links: ISBN 9798400706288,
+Link,
+Document
+
+Cited by: §2.1.
+- Tilley (2001)
+A. R. Tilley
+
+The measure of man and woman: human factors in design.
+
+John Wiley & Sons.
+
+Cited by: §3.3.2.
+- Tsunoda et al. (2024)
+R. Tsunoda, M. Choi, and B. Shizuki
+
+Thumb-to-finger gesture recognition using cots smartwatch accelerometers.
+
+In Proceedings of the International Conference on Mobile and Ubiquitous Multimedia,
+
+MUM ’24, New York, NY, USA, pp. 184–195.
+
+External Links: ISBN 9798400712838,
+Link,
+Document
+
+Cited by: §2.2,
+§3.1.
+- Vasu et al. (2023)
+P. K. A. Vasu, J. Gabriel, J. Zhu, O. Tuzel, and A. Ranjan
+
+Fastvit: a fast hybrid vision transformer using structural reparameterization.
+
+In Proceedings of the IEEE/CVF international conference on computer vision,
+
+pp. 5785–5795.
+
+Cited by: §3.6.2.
+- Waghmare et al. (2023)
+A. Waghmare, I. Chatterjee, and S. Patel
+
+Z-pose: continuous 3d hand pose tracking using single-point bio-impedance sensing on a ring.
+
+In Proceedings of the 2nd Workshop on Smart Wearable Systems and Applications,
+
+SmartWear ’23, New York, NY, USA, pp. 1–6.
+
+External Links: ISBN 9798400703430,
+Link,
+Document
+
+Cited by: §3.6.1.
+- Wang et al. (2018)
+T. Wang, D. Zhang, Y. Zheng, T. Gu, X. Zhou, and B. Dorizzi
+
+C-fmcw based contactless respiration detection using acoustic signal.
+
+Proc. ACM Interact. Mob. Wearable Ubiquitous Technol. 1 (4).
+
+External Links: Link,
+Document
+
+Cited by: §1,
+§3.1,
+§3.3.1,
+§3.3.1.
+- Wang et al. (2016)
+W. Wang, A. X. Liu, and K. Sun
+
+Device-free gesture tracking using acoustic signals.
+
+In Proceedings of the 22nd Annual International Conference on Mobile Computing and Networking,
+
+MobiCom ’16, New York, NY, USA, pp. 82–94.
+
+External Links: ISBN 9781450342261,
+Link,
+Document
+
+Cited by: §2.1.
+- Wen et al. (2016)
+H. Wen, J. Ramos Rojas, and A. K. Dey
+
+Serendipity: finger gesture recognition using an off-the-shelf smartwatch.
+
+In Proceedings of the 2016 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’16, New York, NY, USA, pp. 3847–3851.
+
+External Links: ISBN 9781450333627,
+Link,
+Document
+
+Cited by: §1,
+§2.2,
+§3.1.
+- Wu et al. (2020)
+E. Wu, Y. Yuan, H. Yeo, A. Quigley, H. Koike, and K. M. Kitani
+
+Back-hand-pose: 3d hand pose estimation for a wrist-worn camera via dorsum deformation network.
+
+In Proceedings of the 33rd Annual ACM Symposium on User Interface Software and Technology,
+
+UIST ’20, New York, NY, USA, pp. 1147–1160.
+
+External Links: ISBN 9781450375146,
+Link,
+Document
+
+Cited by: §2.3.
+- Xu et al. (2022)
+X. Xu, J. Gong, C. Brum, L. Liang, B. Suh, S. K. Gupta, Y. Agarwal, L. Lindsey, R. Kang, B. Shahsavari, T. Nguyen, H. Nieto, S. E. Hudson, C. Maalouf, J. S. Mousavi, and G. Laput
+
+Enabling hand gesture customization on wrist-worn devices.
+
+In Proceedings of the 2022 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’22, New York, NY, USA.
+
+External Links: ISBN 9781450391573,
+Link,
+Document
+
+Cited by: §1,
+§2.2,
+§3.1,
+§3.4.
+- Yu et al. (2017)
+C. Yu, Y. Gu, Z. Yang, X. Yi, H. Luo, and Y. Shi
+
+Tap, dwell or gesture? exploring head-based text entry techniques for hmds.
+
+In Proceedings of the 2017 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’17, New York, NY, USA, pp. 4479–4488.
+
+External Links: ISBN 9781450346559,
+Link,
+Document
+
+Cited by: §9.3.3.
+- Yu et al. (2024)
+T. C. Yu, G. Hu, R. Zhang, H. Lim, S. Mahmud, C. Lee, K. Li, D. Agarwal, S. Nie, J. Oh, F. Guimbretière, and C. Zhang
+
+Ring-a-pose: a ring for continuous hand pose tracking.
+
+Proc. ACM Interact. Mob. Wearable Ubiquitous Technol. 8 (4).
+
+External Links: Link,
+Document
+
+Cited by: §1,
+§2.1,
+§3.1,
+§3.3.1,
+§3.6.1,
+§3.6.2,
+§9.2.3,
+§9.3.1.
+- Zhang et al. (2020)
+F. Zhang, V. Bazarevsky, A. Vakunov, A. Tkachenka, G. Sung, C. Chang, and M. Grundmann
+
+Mediapipe hands: on-device real-time hand tracking.
+
+arXiv preprint arXiv:2006.10214.
+
+Cited by: §3.6.1.
+- Zhang et al. (2024)
+Q. Zhang, Y. Lan, K. Guo, and D. Wang
+
+Lipwatch: enabling silent speech recognition on smartwatches using acoustic sensing.
+
+Proc. ACM Interact. Mob. Wearable Ubiquitous Technol. 8 (2).
+
+External Links: Link,
+Document
+
+Cited by: §2.1,
+§3.5.2.
+- Zhang et al. (2023)
+R. Zhang, K. Li, Y. Hao, Y. Wang, Z. Lai, F. Guimbretière, and C. Zhang
+
+EchoSpeech: continuous silent speech recognition on minimally-obtrusive eyewear powered by acoustic sensing.
+
+In Proceedings of the 2023 CHI Conference on Human Factors in Computing Systems,
+
+CHI ’23, New York, NY, USA.
+
+External Links: ISBN 9781450394215,
+Link,
+Document
+
+Cited by: §2.1,
+§2.1.
+- Zhang et al. (2018)
+Y. Zhang, T. Gu, C. Luo, V. Kostakos, and A. Seneviratne
+
+FinDroidHR: smartwatch gesture input with optical heartrate monitor.
+
+Proc. ACM Interact. Mob. Wearable Ubiquitous Technol. 2 (1).
+
+External Links: Link,
+Document
+
+Cited by: §2.2.
