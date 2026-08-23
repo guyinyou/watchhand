@@ -26,8 +26,7 @@ Thumbs.db
 *.log
 
 # 训练可再生产物 / 超 GitHub 单文件 100MB 限制（克隆后 extract.py 重建）
-server/train/dataset*.npz
-server/train/exp*.npz
+*.npz
 server/train/profile_cache/
 server/train/__pycache__/
 server/__pycache__/

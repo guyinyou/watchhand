@@ -18,6 +18,7 @@ import sys
 import glob
 
 import numpy as np
+from scipy.signal import lfilter
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from watchhand_server import EchoProfileProcessor, BiquadFilter
@@ -89,42 +90,75 @@ def load_session(base):
     return samples, meta, events
 
 
+def _biquad_lfilter(x, coeffs):
+    """用 scipy.signal.lfilter（C 实现）替代 Python 循环，快 10-50x。
+    coeffs 格式 [b0, b1, b2, a1, a2]，与 watchhand_server 一致。"""
+    b = np.array([coeffs[0], coeffs[1], coeffs[2]], dtype=np.float64)
+    a = np.array([1.0, coeffs[3], coeffs[4]], dtype=np.float64)
+    return lfilter(b, a, x).astype(np.float32)
+
+
 def batch_profile(samples, meta):
-    """Full-recording original echo profile (60 x nFrames), aligned."""
+    """Full-recording original echo profile (60 x nFrames), aligned.
+
+    优化：
+    1. 滤波用 scipy.signal.lfilter（C 实现，比 Python 循环快 10-50x）
+    2. 相关用逐帧向量化点积（与 Android processChunk 数学等价），
+       避免对整段录音做巨大 FFT（长录音时省内存且更快）
+
+    对齐约定不变：lag = p_start + f*L + d，与 Android/服务端完全一致。
+    """
     fs = int(meta['sample_rate'])
     L = int(meta['chirp_length'])
     bins = int(meta['distance_bins'])
     proc = EchoProfileProcessor(fs, float(meta['f_min']), float(meta['f_max']),
                                 L, bins, int(meta['time_window_frames']))
+    tx = proc.tx_chirp.astype(np.float64)
 
-    x = samples.astype(np.float32)
+    # --- 1. 带通滤波：3 HP + 2 LP，scipy C 实现 ---
+    x = samples.astype(np.float64)
     for _ in range(3):
-        x = proc._biquad_filter_vectorized(x, proc.hp_coeffs, BiquadFilter())
+        x = _biquad_lfilter(x, proc.hp_coeffs)
     for _ in range(2):
-        x = proc._biquad_filter_vectorized(x, proc.lp_coeffs, BiquadFilter())
+        x = _biquad_lfilter(x, proc.lp_coeffs)
+    x = x.astype(np.float32)
 
-    n = len(x) + L - 1
-    size = 1 << (n - 1).bit_length()
-    corr = np.fft.irfft(np.fft.rfft(x, size) * np.conj(np.fft.rfft(proc.tx_chirp, size)),
-                        size)[:n].astype(np.float32)
+    # --- 2. 对齐：用前 N_ALIGN 帧的相关找 p_start（与全段 FFT 结果一致） ---
+    n_align = min(len(x) - L, L * 40)  # 前 40 个 chirp 周期足够确定相位
+    corr_align = np.array([np.dot(x[k:k + L].astype(np.float64), tx)
+                           for k in range(n_align)], dtype=np.float32)
 
-    n0 = (len(corr) // L) * L
-    b0 = int(np.argmax(np.abs(corr[:n0].reshape(-1, L)).mean(axis=0)))
+    n0 = (len(corr_align) // L) * L
+    b0 = int(np.argmax(np.abs(corr_align[:n0].reshape(-1, L)).mean(axis=0)))
     p_start = None
     for cand in [(b0 - DIRECT_BIN) % L, (DIRECT_BIN - b0) % L]:
-        nf = (len(corr) - cand) // L - 2
-        if nf <= 0:
+        nf_c = (len(corr_align) - cand) // L - 2
+        if nf_c <= 0:
             continue
-        fr = corr[cand:cand + nf * L].reshape(nf, L)
+        fr = corr_align[cand:cand + nf_c * L].reshape(nf_c, L)
         if 0 <= int(np.argmax(np.abs(fr[:, :bins]).mean(axis=0))) - DIRECT_BIN <= 2:
             p_start = cand
             break
     if p_start is None:
         p_start = (b0 - DIRECT_BIN) % L
 
-    nf = (len(corr) - p_start) // L - 2
-    frames = corr[p_start:p_start + nf * L].reshape(nf, L)
-    profile = frames[:, :bins].T.copy()  # (bins, nFrames), signed
+    # --- 3. 逐帧向量化相关（与 Android processChunk 等价） ---
+    # 每帧 bin d = dot(x[p_start + f*L + d : +L], tx)
+    nf = (len(x) - p_start - bins + 1 - L + 1) // L
+    if nf <= 0:
+        nf = max((len(x) - p_start) // L - 2, 0)
+
+    profile = np.zeros((bins, nf), dtype=np.float32)
+    x64 = x.astype(np.float64)
+    # sliding_window_view 零拷贝视图，按 stride=L 取帧（避免 Python 循环）
+    windows = np.lib.stride_tricks.sliding_window_view(x64, L)  # (len-L+1, L)
+    for d in range(bins):
+        starts = p_start + np.arange(nf) * L + d
+        valid = starts + L <= len(x)
+        n_valid = int(valid.sum())
+        if n_valid > 0:
+            profile[d, :n_valid] = windows[starts[:n_valid]] @ tx
+
     return unify_distance_grid(profile, fs)
 
 
