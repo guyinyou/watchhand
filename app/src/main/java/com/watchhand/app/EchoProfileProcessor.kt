@@ -12,14 +12,17 @@ import kotlin.math.*
  * 4. Differential profile: |P[f]| - |P[f-1]|
  */
 class EchoProfileProcessor(
-    val sampleRate: Int = 48000,
+    val sampleRate: Int = 44100,
     val fMin: Double = 18000.0,
-    val fMax: Double = 21000.0,
-    val chirpLength: Int = 600,
+    val fMax: Double = 20000.0,
+    val chirpLength: Int = 588,  // 统一 13.333ms chirp（见 AudioManager.chirpLengthFor）
     val distanceBins: Int = 60,
     val timeWindowFrames: Int = 96
 ) {
     val distanceResolutionMm: Double = 343.0 / (2.0 * sampleRate) * 1000.0
+
+    // 直达声锚定 bin，与服务端/extract.py 的 DIRECT_BIN 保持一致
+    private val directBin = 5
 
     // --- Internal state ---
     private val txChirpFloat: FloatArray
@@ -33,21 +36,27 @@ class EchoProfileProcessor(
     private val hpCoeffs: FloatArray
     private val lpCoeffs: FloatArray
 
-    // Ring buffer for filtered audio: need enough for correlation + margin
-    // Correlation output length = rxLen + chirpLen - 1
-    // We need at least timeWindowFrames chirps of valid correlation data
-    // So rx buffer needs: (timeWindowFrames + margin) * chirpLength samples
-    private val processChirps = timeWindowFrames + 30 // extra for alignment margin
-    private val rxBufferSize = processChirps * chirpLength
-    private val rxRing = FloatArray(rxBufferSize)
-    private var rxHead = 0       // next write position in ring
-    private var rxFilled = 0     // how many samples filled so far
+    // 不足一个 chirp 的零头先暂存，凑满整 chirp 才做分段相关：
+    // 段边界永远是 chirp 整数倍 → 帧网格相位恒定，热力图不闪
+    private val pendingBuf = FloatArray(chirpLength)
+    private var pendingPos = 0
 
     // Start alignment offset (found once at beginning)
     private var startOffset = -1
     private val alignBuf = FloatArray(chirpLength * 4)
     private var alignPos = 0
     private var startFound = false
+    private var alignPass = 0  // SNR 连续通过计数：满 8 个 chirp 边界才锁定，保证对齐缓冲全是信号
+
+    // 逐 chirp 分段相关（取代整窗 FFT 重算）：每帧仅 60 bins × 600 ≈ 3.6 万次乘加（≈0.05ms），
+    // 相对整窗 FFT（≈100ms/帧，超预算 8 倍）快 2000 倍，长时间运行/热降频也不会落后丢样本。
+    // 数学上与全流互相关切片等价：seg = 前两个 chirp + 当前 chirp，重叠保证边界完整。
+    private val prevChunks = FloatArray(chirpLength * 2)
+    private val segBuf = FloatArray(chirpLength * 3)
+    private val rollingOrig = FloatArray(distanceBins * timeWindowFrames)
+    private val rollingDiff = FloatArray(distanceBins * (timeWindowFrames - 1))
+    private val newCol = FloatArray(distanceBins)
+    private var producedFrames = 0
 
     init {
         txChirpFloat = generateChirpFloat()
@@ -71,66 +80,72 @@ class EchoProfileProcessor(
             if (!startFound) {
                 alignBuf[alignPos % alignBuf.size] = x
                 alignPos++
-                if (alignPos >= alignBuf.size) {
-                    startOffset = findStartOffset(alignBuf)
-                    startFound = true
-                    rxHead = 0
-                    rxFilled = 0
+                // 缓冲满后按 chirp 边界重试对齐：信号未到（SNR 不足）就继续等，
+                // 避免“先连接后开音”时锁定在纯噪声上
+                if (alignPos >= alignBuf.size && alignPos % chirpLength == 0) {
+                    val off = findStartOffset(alignBuf)
+                    if (off >= 0) {
+                        // 信号刚到时缓冲只有一部分是信号，需连续 8 次通过才锁定
+                        alignPass++
+                        if (alignPass >= 8) {
+                            startOffset = off
+                            startFound = true
+                        }
+                    } else {
+                        alignPass = 0
+                    }
                 }
                 continue
             }
 
-            rxRing[rxHead % rxRing.size] = x
-            rxHead++
-            if (rxFilled < rxRing.size) rxFilled++
+            pendingBuf[pendingPos++] = x
+            if (pendingPos < chirpLength) continue  // 零头先留着，凑满一个 chirp 再做分段相关
+            processChunk()
+            pendingPos = 0
         }
 
-        // Process when we have enough new data since last processing
-        // Need at least chirpLength new samples to produce one new frame
-        val minNewSamples = chirpLength
-        if (rxFilled < rxBufferSize || !startFound) return null
+        if (producedFrames < timeWindowFrames) return null
+        return Triple(rollingOrig.copyOf(), rollingDiff.copyOf(), timeWindowFrames)
+    }
 
-        // Extract contiguous window from ring buffer for processing
-        val extractSize = rxBufferSize
-        val startIdx = ((rxHead - extractSize) % rxRing.size + rxRing.size) % rxRing.size
-        val rxData = FloatArray(extractSize)
-        for (i in 0 until extractSize) {
-            rxData[i] = rxRing[(startIdx + i) % rxRing.size]
+    /**
+     * 每凑满一个 chirp 产出一帧：对（前 2 个 chirp + 当前 chirp）做分段互相关，
+     * 取 60 个距离 bin 作为新列，滚动更新 96 帧窗口。
+     * 与全流互相关切片等价，但计算量仅 60×600 乘加/帧。
+     */
+    private fun processChunk() {
+        val L = chirpLength
+        // seg = 前两个 chirp + 当前 chirp
+        for (i in 0 until 2 * L) segBuf[i] = prevChunks[i]
+        for (i in 0 until L) segBuf[2 * L + i] = pendingBuf[i]
+        // 滚动 overlap 窗口
+        for (i in 0 until L) prevChunks[i] = prevChunks[i + L]
+        for (i in 0 until L) prevChunks[L + i] = pendingBuf[i]
+
+        // 取 bin：相关约定 lag = startOffset + d（与 extract.py 互相关一致，
+        // 直达声锚定 directBin，流式/批处理/训练逐帧同网格）
+        for (d in 0 until distanceBins) {
+            val k = startOffset + d
+            var sum = 0f
+            for (j in 0 until L) sum += segBuf[k + j] * txChirpFloat[j]
+            newCol[d] = sum
         }
 
-        // Apply start alignment: skip startOffset samples
-        val alignedRx = rxData.copyOfRange(startOffset.coerceIn(0, rxData.size - 1), rxData.size)
-
-        // Full cross-correlation
-        val corr = crossCorrelateFull(alignedRx, txChirpFloat)
-
-        // Reshape into frames: each frame is chirpLength samples
-        val nFrames = corr.size / chirpLength
-        if (nFrames < timeWindowFrames) return null
-
-        // Build original profile: take first distanceBins of each frame
-        // Keep only the most recent timeWindowFrames
-        val frameStart = nFrames - timeWindowFrames
-        val originalProfile = FloatArray(distanceBins * timeWindowFrames)
-        for (fi in 0 until timeWindowFrames) {
-            val frameIdx = frameStart + fi
-            val offset = frameIdx * chirpLength
-            for (d in 0 until distanceBins) {
-                originalProfile[d * timeWindowFrames + fi] = corr[offset + d]
-            }
+        // 96 帧窗口左移一列，新列追加到尾部
+        for (d in 0 until distanceBins) {
+            val base = d * timeWindowFrames
+            for (fi in 0 until timeWindowFrames - 1) rollingOrig[base + fi] = rollingOrig[base + fi + 1]
+            rollingOrig[base + timeWindowFrames - 1] = newCol[d]
         }
-
-        // Differential profile
-        val diffProfile = FloatArray(distanceBins * (timeWindowFrames - 1))
-        for (fi in 1 until timeWindowFrames) {
-            for (d in 0 until distanceBins) {
-                val curr = abs(originalProfile[d * timeWindowFrames + fi])
-                val prev = abs(originalProfile[d * timeWindowFrames + fi - 1])
-                diffProfile[d * (timeWindowFrames - 1) + fi - 1] = curr - prev
-            }
+        // 差分轮廓同样滚动：diff[f] = |P[f]| - |P[f-1]|（论文约定，abs 只在这里用）
+        for (d in 0 until distanceBins) {
+            val base = d * (timeWindowFrames - 1)
+            for (fi in 0 until timeWindowFrames - 2) rollingDiff[base + fi] = rollingDiff[base + fi + 1]
+            val curr = abs(rollingOrig[d * timeWindowFrames + timeWindowFrames - 1])
+            val prev = abs(rollingOrig[d * timeWindowFrames + timeWindowFrames - 2])
+            rollingDiff[base + timeWindowFrames - 2] = curr - prev
         }
-
-        return Triple(originalProfile, diffProfile, timeWindowFrames)
+        producedFrames++
     }
 
     fun reset() {
@@ -139,11 +154,15 @@ class EchoProfileProcessor(
         hpState3 = BiquadState()
         lpState1 = BiquadState()
         lpState2 = BiquadState()
-        rxHead = 0
-        rxFilled = 0
         startOffset = -1
         alignPos = 0
         startFound = false
+        alignPass = 0
+        pendingPos = 0
+        producedFrames = 0
+        prevChunks.fill(0f)
+        rollingOrig.fill(0f)
+        rollingDiff.fill(0f)
     }
 
     // ===================== Internal methods =====================
@@ -155,7 +174,9 @@ class EchoProfileProcessor(
         for (n in 0 until chirpLength) {
             val t = n.toDouble() / sampleRate
             val phase = 2.0 * PI * (f0 * t + (f1 - f0) * t * t / (2.0 * T))
-            signal[n] = cos(phase).toFloat()
+            // 汉宁窗：与发射 chirp（FmcwGenerator）保持一致，保证匹配滤波一致性
+            val window = 0.5 * (1.0 - cos(2.0 * PI * n / (chirpLength - 1)))
+            signal[n] = (cos(phase) * window).toFloat()
         }
         return signal
     }
@@ -200,39 +221,45 @@ class EchoProfileProcessor(
     private class BiquadState(var z1: Float = 0f, var z2: Float = 0f)
 
     private fun findStartOffset(buf: FloatArray): Int {
-        // Cross-correlate with tx chirp, find earliest strong peak
-        val searchLen = minOf(buf.size + chirpLength - 1, chirpLength * 3)
-        var bestIdx = 0; var bestVal = 0f
+        // 与 extract.py batch_profile 的 p_start 约定一致：相关约定 corr[k]=Σ buf[k+j]·tx[j]，
+        // b0 = 逐 chirp 平均幅度最大的 bin，候选 + 直达峰验证，返回 p_start
+        val L = chirpLength
+        val searchLen = minOf(buf.size + L - 1, L * 3)
+        val corr = FloatArray(searchLen)
+        var sumAbs = 0f; var maxAbs = 0f
         for (k in 0 until searchLen) {
             var sum = 0f
-            val jMin = max(0, k - buf.size + 1)
-            val jMax = min(chirpLength - 1, k)
-            for (j in jMin..jMax) sum += buf[k - j] * txChirpFloat[j]
-            val v = abs(sum)
-            if (v > bestVal) { bestVal = v; bestIdx = k }
+            val jMax = min(L - 1, buf.size - 1 - k)
+            for (j in 0..jMax) sum += buf[k + j] * txChirpFloat[j]
+            corr[k] = sum
+            val a = abs(sum)
+            sumAbs += a
+            if (a > maxAbs) maxAbs = a
         }
-        // Paper's adjustment: align to frame center
-        val halfL = chirpLength / 2
-        return ((bestIdx + chirpLength - halfL) % chirpLength).coerceIn(0, chirpLength - 1)
+        // SNR 门槛：直达声峰值需显著高于相关底噪（实测信号 ≈14，静默 ≈5）
+        if (sumAbs <= 0f || maxAbs < 9 * sumAbs / searchLen) return -1
+        val n0 = (searchLen / L) * L
+        var b0 = 0; var best = -1f
+        for (d in 0 until L) {
+            var s = 0f
+            var k = d
+            while (k < n0) { s += abs(corr[k]); k += L }
+            if (s > best) { best = s; b0 = d }
+        }
+        var pStart = (b0 - directBin % L + L) % L
+        for (cand in intArrayOf((b0 - directBin + L) % L, (directBin - b0 + L) % L)) {
+            val nf = (searchLen - cand) / L - 2
+            if (nf <= 0) continue
+            var am = 0; var amv = -1f
+            for (d in 0 until distanceBins) {
+                var s = 0f
+                for (f2 in 0 until nf) s += abs(corr[cand + f2 * L + d])
+                if (s > amv) { amv = s; am = d }
+            }
+            if (am - directBin in 0..2) { pStart = cand; break }
+        }
+        // 帧相位对齐：bin d 取 lag = startOffset + d，需 startOffset ≡ pStart (mod L)
+        return pStart % L
     }
 
-    /**
-     * Full cross-correlation: output[k] = sum_j rx[k-j] * tx[j]
-     * This matches the paper's Rx  Tx operation.
-     */
-    private fun crossCorrelateFull(rx: FloatArray, tx: FloatArray): FloatArray {
-        val n = rx.size + tx.size - 1
-        val result = FloatArray(n)
-        // Only compute up to what we need: nFrames * chirpLength where nFrames = timeWindowFrames + margin
-        val needed = (processChirps) * chirpLength
-        val computeLen = minOf(n, needed)
-        for (k in 0 until computeLen) {
-            var sum = 0f
-            val jMin = max(0, k - rx.size + 1)
-            val jMax = min(tx.size - 1, k)
-            for (j in jMin..jMax) sum += rx[k - j] * tx[j]
-            result[k] = sum
-        }
-        return result
-    }
 }

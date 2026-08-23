@@ -6,17 +6,19 @@ import kotlin.math.cos
 /**
  * Generates FMCW (Frequency-Modulated Continuous Wave) chirp signals.
  *
- * Parameters match the WatchHand paper:
- * - Frequency range: 18-21 kHz (inaudible)
- * - Chirp length: 600 samples
- * - Sample rate: 48 kHz
- * - Chirp duration: 12.5 ms
+ * 跨硬件统一参数（适配 48 kHz / 44.1 kHz 原生采样率）：
+ * - Frequency range: 18-20 kHz（两种硬件共同的安全频段，
+ *   44.1 kHz 下保证 Nyquist 余量；论文为 18-21 kHz @ 48 kHz）
+ * - Chirp duration: 13.333 ms（= 4/300 s，两种采样率下均为整数样本：
+ *   640 @ 48kHz / 588 @ 44.1kHz，帧率统一 75fps，
+ *   由 AudioManager.chirpLengthFor(rate) 计算）
+ * - Sample rate: 设备原生采样率（必须，避免系统 SRC 重采样）
  */
 class FmcwGenerator(
-    val sampleRate: Int = 48000,
+    val sampleRate: Int = 44100,
     val fMin: Double = 18000.0,
-    val fMax: Double = 21000.0,
-    val chirpLength: Int = 600
+    val fMax: Double = 20000.0,
+    val chirpLength: Int = 588
 ) {
     /** Duration of one chirp in seconds */
     val chirpDuration: Double = chirpLength.toDouble() / sampleRate
@@ -42,7 +44,9 @@ class FmcwGenerator(
         for (n in 0 until chirpLength) {
             val t = n.toDouble() / sampleRate
             val phase = 2.0 * PI * (f0 * t + (f1 - f0) * t * t / (2.0 * T))
-            val sample = cos(phase)
+            // Hann window to reduce spectral leakage and transient distortion
+            val window = 0.5 * (1.0 - cos(2.0 * PI * n / (chirpLength - 1)))
+            val sample = cos(phase) * window
             signal[n] = (sample * Short.MAX_VALUE).toInt().toShort()
         }
         return signal

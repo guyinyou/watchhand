@@ -1,247 +1,110 @@
 # WatchHand 项目上下文
 
-> 本文档记录项目所有关键上下文，用于跨机器/跨会话无缝继续开发。
+> 记录项目所有关键上下文与决策，用于跨会话无缝继续开发。最后更新：2026-08-23。
 
 ---
 
 ## 1. 项目概述
 
-**目标**：复现论文 WatchHand（arXiv:2602.21610, ACM CHI 2026），实现基于智能手表/手机的连续 3D 手部姿态追踪。
+复现论文 WatchHand（arXiv:2602.21610, CHI 2026）：商用设备扬声器+麦克风发射 FMCW 超声，回声轮廓 + 深度学习做连续手部感知。
 
-**论文核心**：仅用商用智能手表的内置扬声器 + 麦克风，发射 18-21kHz FMCW 超声信号，通过回声轮廓 + 深度学习实现 20 个手指关节的 3D 姿态追踪。
-
-**当前阶段**：数据预处理 + 可视化管线已验证通过，待进入数据采集和模型训练阶段。
+**当前阶段**：手势分类闭环跑通（采集→提取→训练→测试→ONNX→服务端实时预测）。跨会话 window-acc ~0.56（混合训练+单类测试协议），瓶颈是数据量，持续采集中。远期目标仍是论文的 20 关节 3D 追踪（需 MediaPipe ground truth）。
 
 ---
 
-## 2. 代码结构
+## 2. 架构与代码结构
 
 ```
-watchhand-android/
-├── build.gradle.kts              # AGP 8.7.3 + Kotlin 2.1.0 + Compose Plugin 2.1.0
-├── settings.gradle.kts
-├── gradle.properties
-├── local.properties              # SDK 路径（需根据机器修改）
-├── gradle/wrapper/
-│   └── gradle-wrapper.properties # Gradle 8.7
-└── app/
-    ├── build.gradle.kts          # minSdk=26, targetSdk=34, Compose BOM 2024.06.00
-    └── src/main/
-        ├── AndroidManifest.xml   # RECORD_AUDIO + MODIFY_AUDIO_SETTINGS 权限
-        └── java/com/watchhand/app/
-            ├── FmcwGenerator.kt          # FMCW 扫频信号生成（18-21kHz, 600 samples/chirp）
-            ├── EchoProfileProcessor.kt   # 核心：回声轮廓处理（滤波→互相关→reshape→差分）
-            ├── AudioManager.kt           # 音频采集管理（同时播放+录音+实时处理）
-            └── MainActivity.kt           # UI + 热力图可视化
-```
-
-**Git 仓库**：https://github.com/guyinyou/watchhand
-
----
-
-## 3. 构建环境
-
-### 必需工具
-- **JDK 17**（Microsoft OpenJDK 21 有 bug，必须用 Oracle/Corretto 17）
-- **Gradle 9.7**（通过 Homebrew 安装：`brew install gradle`）
-- **Android SDK**：
-  - Platform 34（compileSdk）
-  - Build-Tools（最新版）
-  - Command-line Tools
-- **AGP 8.7.3**（兼容 Gradle 9.x）
-
-### 构建命令
-```bash
-export JAVA_HOME=/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home
-cd watchhand-android
-gradle :app:assembleDebug --no-daemon
-```
-
-### 安装到设备
-```bash
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-```
-
-### 截图调试
-```bash
-adb exec-out screencap -p > screenshot.png
+app/                          Android 客户端（Kotlin/Compose）
+  FmcwGenerator.kt            chirp 生成（汉宁窗，与服务端模板一致）
+  EchoProfileProcessor.kt     本地流式轮廓（逐 chirp 分段相关）
+  AudioManager.kt             播放+录音；连接时只发 raw，跳过本地处理
+  TcpAudioClient.kt           单例 TCP；header 在首包数据时发；串行发送防乱序
+  MainActivity.kt             UI + 本地热力图 + 连接控制
+server/
+  WatchHandServer.java        Java 服务端（唯一处理端；JDK17 + server/lib/onnxruntime jar）
+  start_server.sh             启动（-cp ".:lib/*"，默认端口 9999）
+  train/
+    extract.py                raw→双通道窗口（带会话级缓存 profile_cache/）
+    train.py                  训练（last.pt 每 epoch 原子覆盖、自动续训）
+    test.py                   评估（--split test/train/all）
+    export_onnx.py            last.pt → last.onnx
+    run_pipeline.sh           一键 extract→train→test→export
+    train_window.py           FastViT-T12 基线（历史对照）
 ```
 
 ---
 
-## 4. 信号处理管线（核心）
+## 3. 统一信号参数（三端一致，改动需同步）
 
-### 参数
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| 采样率 | 48 kHz | Android AudioRecord/AudioTrack |
-| FMCW 频段 | 18-21 kHz | 不可闻超声波 |
-| Chirp 长度 | 600 samples | 12.5ms |
-| Chirp 速率 | 80 Hz | 48000/600 |
-| 距离分辨率 | 3.57 mm/pixel | C/(2×Fs) = 343/96000 |
-| 距离范围 | 21.42 cm | 60 bins × 3.57mm |
-| 时间窗口 | 96 frames | 1.2 秒 |
-
-### Algorithm 1 实现步骤
-
-1. **带通滤波**：3 级 HP (18kHz) + 2 级 LP (21kHz) biquad 级联 ≈ 5 阶 Butterworth
-   - 系数用 Audio EQ Cookbook 公式计算
-   - 滤波器状态跨 feed 调用保持（流式处理）
-
-2. **起始位置检测**：收集前 4 个 chirp 的数据，与 tx chirp 做互相关找直达声峰值
-   - 论文公式：`p_start = (p_start + L - ⌊L/2⌋) mod L`
-
-3. **整段互相关**（关键！）：
-   - **不是**逐 chirp 互相关（会导致边界错位）
-   - **而是**对累积的整段滤波后数据做一次大互相关
-   - 然后 reshape 成帧（每帧 600 samples）
-   - 每帧取前 60 个样本作为距离 bin
-
-4. **差分轮廓**：`|P[f]| - |P[f-1]|`（帧间幅度差）
-
-5. **输出布局**：列优先 `[distanceBins × frameCount]`
+| 参数 | 值 | 同步点 |
+|------|-----|--------|
+| 采样率 | 44.1kHz（48k 硬件经 SRC，已验证不闪） | 客户端请求值 |
+| 频段 | 18–20kHz | `fMaxFor(sampleRate)` 客户端/服务端同步 |
+| Chirp | 588 samples @75fps | 客户端 `CHIRP_LENGTH` ↔ 服务端 `CHIRP_LENGTH` |
+| 距离 | 60 bins × 3.89mm | extract / 服务端 / APK |
+| 窗口 | 96 帧（1.28s），stride 22 | extract ↔ train |
+| DIRECT_BIN | 5 | extract / 服务端 / APK |
 
 ---
 
-## 5. 可视化
+## 4. 对齐约定与锁定生命周期（核心教训）
 
-### 色图
-- **原始回声轮廓**：viridis（紫→绿→黄）
-- **差分回声轮廓**：diverging（蓝→黑→黄）
-
-### Clipping 策略
-- **论文**：固定 ±10¹⁰（针对手表硬件调的）
-- **我们**：2%/98% percentile clipping（自适应不同硬件）
-- **训练时**：不做 clipping，只用窗口归一化（论文要求）
-
-### 背景色
-- Canvas 先画 viridis(0) 作为底色（深紫蓝），匹配论文 Figure 4/5
-
-### UI 显示
-- 参数信息卡片显示可视化范围（2%-98% percentile 值）
+- **相关约定**：bin d 取 lag = `startOffset + d`（Σ seg[k+j]·tx[j]），**不是卷积 k−j**；`startOffset = p_start`（b0 逐 chirp 平均 |corr| 最大 bin，候选 (b0−5)%L / (5−b0)%L + 直达峰验证）。旧卷积+论文式 (bestIdx+L/2) 公式把直达声放到 bin≈295（窗口外），表现为 Pred 恒定、幅度缩 45 倍。
+- **锁定生命周期**：SNR = max|corr|/mean|corr| ≥ 9（信号 13.5–14.2，静默 ≈5.2，带零能量保护）且**连续 8 个 chirp 边界**通过才锁；服务端额外做**流间断 >500ms 重建处理器**（客户端 stop→start 断流 ⇒ 等价本地"处理器随音频会话生灭"）。
+- socket 有序连续，首包即会话 t=0，与本地同起点；不需要传输层静默建模。
 
 ---
 
-## 6. 关键决策与教训
+## 5. 采集与划分协议
 
-### 6.1 逐 chirp 互相关 ≠ 整段互相关
-**错误做法**：把录音切成单个 chirp → 每个 chirp 单独做互相关
-**正确做法**：累积整段数据 → 一次大互相关 → reshape
-
-原因：startOffset 的存在导致逐 chirp 切分会跨边界混合数据，互相关结果完全错误。
-
-### 6.2 流式处理 vs 批处理
-**错误做法**：累积数据 → 每次处理整个窗口 → 帧数跳动
-**正确做法**：环形缓冲区 → 增量 feed → 每满一个 chirp 产出一帧 → 滚动窗口
-
-### 6.3 停止闪退
-AudioTrack.stop() / AudioRecord.stop() 在状态不对时抛 IllegalStateException。
-**解决**：先检查 playState/recordingState，再 stop，全部包 try-catch。
-
-### 6.4 FMCW 频率选择：SNR vs 可闻性
-- 18-21kHz 理论上不可闻，但年轻人能听到 18kHz
-- 扬声器非线性失真会产生可听谐波（互调失真）
-- 手机扬声器功率大 → 震动感明显
-- 手表扬声器功率小（61-81 dBA）→ 可闻性低
-- **这是 trade-off，无法完全消除**
-
-### 6.5 设备差异
-- 不同手表的扬声器/麦克风位置不同 → 回声轮廓时空模式不同
-- 数据集不能跨设备直接使用
-- 论文有通用校准算法（峰值错位校正 + 周期性漂移校准），我们尚未实现
+- 引导式循环采集：classes 列表（**train 用 "0,1,2" 混合**，0=rest trial）、trial 2.5s、rounds 可配、test set 复选框决定目录。
+- **边界不插零长度 0 事件**（用户要求；训练不需要 mask）；仅启动后 2s 准备期为 0。
+- **划分**：train/ = 混合会话，test/ = 单类会话。
+- 数据三件套 .raw/.labels/.meta；历史带边界标记的 .labels 已清洗。
 
 ---
 
-## 7. 设备兼容性
+## 6. 训练管线
 
-### 已验证
-| 设备 | 系统 | 采样率 | 状态 |
-|------|------|--------|------|
-| nubia NX769J (Z70 Ultra) | Android 16 | 48 kHz | ✅ 管线通，SNR 低，可闻性高 |
-
-### 论文验证设备
-| 设备 | 扬声器功率 (10cm) | 状态 |
-|------|------------------|------|
-| Samsung Galaxy Watch 7 | 61.6 dBA | ✅ 论文验证 |
-| Xiaomi Watch 2 Pro | 66.9 dBA | ✅ 论文验证 |
-| Google Pixel Watch 3 | 80.8 dBA | ✅ 论文验证 |
-
-### 硬件要求
-- 扬声器 + 麦克风（至少各一个）
-- 支持 48kHz 16-bit PCM 同时播放和录制
-- Android API 26+（AudioRecord.Builder / AudioTrack.Builder / UNPROCESSED 音频源）
+- **extract.py**：批处理整段互相关（FFT，`irfft(spec, size)`）→ p_start 对齐 → 双通道（原始带符号 + 差分 |P[f]|−|P[f−1]|）→ 滑窗。**无设备校准**（决策：稳定伪影/漂移交给模型学；校准曾实现又删，PROCESS_VERSION=3 使旧缓存失效）。会话级缓存按 (版本, raw/meta size+mtime) 失效。
+- **train.py**：帧 CNN（距离轴 2× 下采样×3，时间不降采样）→ 因果 Transformer（默认 4 层 d256 = 3.74M；`--layers/--dmodel` 调容量）→ 密集头：后半窗 12 步（48::4，~54ms）× **10 类**（`--classes` 默认 10，空类留位）。损失 = 12 步普通交叉熵。增广：位移±2 + 幅度抖动 + **输入级 drop**（`--drop` 默认 0.3，随机抹时间/距离段）+ dropout 0.2。
+- **续训**：last.pt 每 epoch 原子保存（.tmp + os.replace）；只拦截影响形状的配置（dmodel/layers/classes），dropout/drop 改了可无缝续训。损坏检查点改名归档不删。
+- **容量策略**：容量跟数据量匹配——小噪数据用小模型（2 层 d128），干净混合数据用默认大模型；数据涨一档试一次更大容量，val 定取舍。
+- **head-only 适配**：扩类时旧头权重前 N 行移植到新头、冻结 backbone 先训头 5–10 epoch，phase check 后决定是否解冻。
 
 ---
 
-## 8. 当前状态
+## 7. 实时推理
 
-### 已完成
-- [x] FMCW 信号生成器
-- [x] 带通滤波（biquad 级联）
-- [x] 起始位置检测
-- [x] 整段互相关 + reshape
-- [x] 差分回声轮廓
-- [x] 流式处理（环形缓冲区）
-- [x] 可视化（viridis + diverging 色图 + percentile clipping）
-- [x] 停止闪退修复
-- [x] 帧数稳定（96 帧滚动窗口）
-- [x] APK 构建 + 安装
-
-### 待完成
-- [ ] 窗口归一化（训练用，论文 Section 3.3.2）
-- [ ] 设备校准算法（峰值错位校正 + 周期性漂移校准，论文 Section 3.3.3）
-- [ ] 数据采集方案设计（手势协议、session 设计）
-- [ ] Ground Truth 采集（MediaPipe Hands + webcam）
-- [ ] 模型训练（FastViT-T12 回归 20 关节 3D 坐标）
-- [ ] 三种训练协议（within-session / cross-session / cross-user）
+- `export_onnx.py` 导出（torch vs onnx 测试集 100% 一致）；服务端 ONNX Runtime 每 2 帧推理一次，取末步 argmax 显示 `Pred: N`（0 灰/1 绿/2 红/其余蓝）。
+- 服务端输入构造与 train 完全一致：edge pad 60→64、差分通道、逐通道窗口归一化。
 
 ---
 
-## 9. 下一步行动
+## 8. 关键决策与教训（精选）
 
-### 立即可做
-1. **继续用手机调试**：提高音量找到 SNR sweet spot，验证手部移动时能看到曲线模式
-2. **设计数据采集方案**：参考论文 Study 1 的 18 种手势协议
-
-### 中期
-3. **获取/采集数据集**：论文已开源 35.6 小时数据集（40 人）
-4. **实现归一化 + 校准**
-5. **搭建训练环境**（Python + PyTorch + FastViT-T12）
-
-### 长期
-6. **上手表设备**：购买 Galaxy Watch 7 或类似 WearOS 手表
-7. **端侧部署**：模型量化到 26.7MB，在手表上实时推理（0.115s 延迟）
+1. **逐 chirp 分段相关**取代整窗 FFT 重算（0.05ms/帧 vs 100ms/帧），帧网格锚定 chirp 整数倍 ⇒ 不闪。
+2. **闪烁真因**是帧网格漂移+算力积压，非 SRC；统一 44.1kHz 可行。
+3. **原始轮廓保留带符号值**（论文约定），abs 只进差分。
+4. **不做设备校准**；跨会话泛化瓶颈是数据量与摆位漂移，混合训练解耦类别与会话漂移。
+5. **产物不删只改名归档**；**只执行用户指定步骤**（不擅自训练/截图）。
+6. 训练日志 train acc 在 drop 增广样本上计算，低于 test.py --split train 的干净评估，属口径差异。
 
 ---
 
-## 10. 参考资源
+## 9. 当前状态与下一步
 
-- 论文：https://arxiv.org/abs/2602.21610
-- 论文 HTML：https://arxiv.org/html/2602.21610v1
-- 论文 PDF（ACM）：https://dl.acm.org/doi/10.1145/3772318.3790932
-- 数据集：论文提到已开源，需查找具体发布位置
-- FastViT-T12：https://github.com/apple/ml-fastvit
-- MediaPipe Hands：https://google.github.io/mediapipe/solutions/hands
+- 已完成：闭环全链路、对齐/锁定生命周期、采集协议、10 类头、缓存、原子保存、文档沉淀、全部入 git。
+- 指标：train 0.98+；test window-acc ~0.5–0.56（数据受限）。
+- 下一步：① 更多混合会话数据（不同时段/摆位）；② 手势扩到 10 类；③ 数据足够后试更大容量/FastViT；④ 远期 MediaPipe ground truth + 3D 回归。
 
 ---
 
-## 11. 常见问题
+## 10. 仓库与构建
 
-### Q: 为什么热力图偏黄？
-A: 直达声值远大于其他区域，min-max 归一化后大部分值落在高范围。用 percentile clipping 解决。
-
-### Q: 为什么有震动感/可闻性？
-A: 18kHz 年轻人能听到 + 扬声器非线性失真产生可听谐波。手机扬声器功率大，问题更明显。
-
-### Q: 数据集拿到能直接用吗？
-A: 不能。不同设备的扬声器/麦克风位置不同，回声轮廓模式不同。需要用自己的设备采集数据。
-
-### Q: 训练时需要 clipping 吗？
-A: 不需要。论文说 "to preserve maximum information, we use the raw unclipped echo profiles during training"。只用窗口归一化。
-
-### Q: 可视化范围和论文不一样？
-A: 正常。±10¹⁰ 是论文针对手表硬件调的。不同硬件的值范围不同，percentile clipping 自动适应。
-
----
-
-*最后更新：2026-08-17*
+- 远程：git@github.com:guyinyou/watchhand.git
+- APK：`./build_apk.sh [--install <serial>]`（JDK17 + Gradle 9.7 + AGP 8.7.3）
+- 服务端：`javac -cp "lib/*" WatchHandServer.java && ./start_server.sh`
+- 训练：python 3.10（/Library/Frameworks/Python.framework/Versions/3.10）+ torch 2.5.1（MPS 稳定）
+- .gitignore 排除：dataset*.npz / exp*.npz（>100MB GitHub 限制）、profile_cache/、__pycache__/、*.log；克隆后 `extract.py` 可重建数据集。

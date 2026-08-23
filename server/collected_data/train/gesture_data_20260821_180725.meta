@@ -1,0 +1,12 @@
+sample_rate=44100
+channels=1
+bits=16
+num_raw_samples=6234417
+duration_s=141.37
+f_min=18000
+f_max=20000
+chirp_length=588
+chirp_duration_ms=13.333
+distance_bins=60
+time_window_frames=96
+started_at=2026-08-21 18:07:25

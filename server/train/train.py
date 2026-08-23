@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+连续手势分类：密集时间头，~50ms 步长。严格按论文管线：
+双通道 2x60x96 回声轮廓（原始+差分）-> 窗口内归一化（论文 3.3.2）
+-> 帧 CNN（只下采样距离轴）-> 因果 Transformer -> 密集分类头。
+损失：12 个输出步上的普通交叉熵，无 mask/类权重/label smoothing。
+
+每次运行自动从 last.pt 续训，每个 epoch 覆盖保存 last.pt。
+
+Usage (project python 3.10):
+  python3 train.py [--epochs 60] [--batch 32] [--last last.pt] [--reset]
+"""
+
+import argparse
+import os
+
+import numpy as np
+import torch
+
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+OUT_START, OUT_STRIDE = 48, 4                      # 后半窗口、~54ms 一步
+OUT_IDX = list(range(OUT_START, 96, OUT_STRIDE))   # 12 个密集输出步
+D_MODEL = 256
+
+
+# ------------------------------------------------------------ dataset
+
+class DenseDataset(Dataset):
+    """2x60x96 窗口 -> 距离轴 pad 到 64，窗口内逐通道归一化（论文 3.3.2）。"""
+
+    def __init__(self, X, Y, augment=False, drop=0.0, rng=None):
+        self.X = np.pad(X, ((0, 0), (0, 0), (0, 4), (0, 0)), mode='edge')
+        self.Y = Y
+        self.augment = augment
+        self.drop = drop
+        self.rng = rng or np.random.default_rng()
+
+    def __len__(self):
+        return len(self.Y)
+
+    @staticmethod
+    def _shift_zero(w, s):
+        out = np.zeros_like(w)
+        n = w.shape[1]
+        if s > 0:
+            out[:, :n - s] = w[:, s:]
+        elif s < 0:
+            out[:, -s:] = w[:, :n + s]
+        return out
+
+    def __getitem__(self, i):
+        x = self.X[i].copy()
+        if self.augment:
+            r = self.rng
+            # 距离轴小位移（残差漂移）+ 幅度抖动
+            x = self._shift_zero(x, int(r.integers(-2, 3)))
+            if r.random() < 0.8:
+                x *= r.uniform(0.95, 1.05)
+            # drop 机制：随机抹掉时间/距离段（SpecAugment 式），
+            # 迫使模型不依赖局部纹理性过拟合
+            if self.drop > 0 and r.random() < self.drop:
+                t0 = int(r.integers(0, 96 - 15))
+                x[:, :, t0:t0 + int(r.integers(5, 16))] = 0
+            if self.drop > 0 and r.random() < self.drop:
+                d0 = int(r.integers(0, 64 - 10))
+                x[:, d0:d0 + int(r.integers(5, 11)), :] = 0
+        # 窗口内归一化（论文 3.3.2）
+        for c in range(x.shape[0]):
+            mu, sd = x[c].mean(), x[c].std()
+            x[c] = (x[c] - mu) / (sd + 1e-6)
+        return (torch.from_numpy(x.astype(np.float32)),
+                torch.tensor(self.Y[i], dtype=torch.long))
+
+
+# ------------------------------------------------------------ model
+
+class DenseGestureModel(nn.Module):
+    """帧 CNN（时间步长 1）+ 因果 Transformer + 密集分类头。"""
+
+    def __init__(self, num_classes, d_model=D_MODEL, layers=4, dropout=0.2):
+        super().__init__()
+        self.frame_cnn = nn.Sequential(
+            nn.Conv2d(2, 64, 3, stride=(2, 1), padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 128, 3, stride=(2, 1), padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128, d_model, 3, stride=(2, 1), padding=1), nn.BatchNorm2d(d_model), nn.ReLU(),
+            nn.AvgPool2d(kernel_size=(8, 1)),  # 距离 8 -> 1，时间保持 96
+        )
+        self.pos = nn.Parameter(0.02 * torch.randn(96, d_model))
+        layer = nn.TransformerEncoderLayer(d_model, nhead=8, dim_feedforward=4 * d_model,
+                                           dropout=dropout, batch_first=True, norm_first=True)
+        self.temporal = nn.TransformerEncoder(layer, num_layers=layers)
+        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, num_classes))
+        self._causal = torch.full((96, 96), float('-inf')).triu(1)
+
+    def forward(self, x):
+        f = self.frame_cnn(x).squeeze(2)                 # (B, D, 96)
+        f = f.permute(0, 2, 1) + self.pos                # (B, 96, D)
+        h = self.temporal(f, mask=self._causal.to(x.device))
+        return self.head(h[:, OUT_IDX])                  # (B, 12, K)
+
+
+# ------------------------------------------------------------ training
+
+def run_epoch(model, loader, device, criterion, opt=None):
+    train_mode = opt is not None
+    model.train(train_mode)
+    loss_sum, correct, total = 0.0, 0, 0
+    with torch.set_grad_enabled(train_mode):
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            logits = model(x)                            # (B, 12, K)
+            ys = y[:, OUT_IDX]
+            loss = criterion(logits.reshape(-1, logits.shape[-1]), ys.reshape(-1))
+            if train_mode:
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+            n = ys.numel()
+            loss_sum += loss.item() * n
+            with torch.no_grad():
+                correct += (logits.argmax(-1) == ys).sum().item()
+                total += n
+    return loss_sum / max(total, 1), correct / max(total, 1)
+
+
+def window_acc(model, loader, device):
+    """窗口级多数表决准确率。"""
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x).argmax(-1)                   # (B, 12)
+            for p, t in zip(pred, y[:, OUT_IDX]):
+                pv, tv = p.cpu().numpy(), t.cpu().numpy()
+                correct += np.bincount(pv).argmax() == np.bincount(tv).argmax()
+                total += 1
+    return correct / max(total, 1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--data', default='dataset.npz')
+    ap.add_argument('--epochs', type=int, default=60)
+    ap.add_argument('--classes', type=int, default=10,
+                    help='输出分类数固定 10（当前数据不足 10 类时空类留位，后续加手势不用改结构）')
+    ap.add_argument('--batch', type=int, default=32)
+    ap.add_argument('--lr', type=float, default=1e-4)
+    ap.add_argument('--wd', type=float, default=1e-3)
+    ap.add_argument('--layers', type=int, default=4, help='transformer 层数 (2=small)')
+    ap.add_argument('--dmodel', type=int, default=D_MODEL)
+    ap.add_argument('--dropout', type=float, default=0.2)
+    ap.add_argument('--drop', type=float, default=0.3,
+                    help='训练时随机 drop 时间/距离段的概率（0 关闭）')
+    ap.add_argument('--last', default='last.pt', help='每个 epoch 覆盖保存的续训检查点')
+    ap.add_argument('--reset', action='store_true', help='忽略 last.pt 从头训练')
+    ap.add_argument('--device', default=None, help='mps/cpu; auto-detect if omitted')
+    ap.add_argument('--exclude-session', type=int, nargs='*', default=[],
+                    help='丢弃指定 session 索引的窗口（如质量差的手动采集会话）')
+    args = ap.parse_args()
+
+    data = np.load(args.data)
+    X, Y, session = data['X'], data['Y'], data['session']
+    split = data['split'] if 'split' in data.files else None
+    # 输出头固定 10 类（用户决策）；数据类数超过时自动扩展
+    num_classes = max(args.classes, int(Y.max()) + 1)
+    if args.exclude_session:
+        keep = np.ones(len(Y), dtype=bool)
+        for s in args.exclude_session:
+            keep &= session != s
+        X, Y, session = X[keep], Y[keep], session[keep]
+        if split is not None:
+            split = split[keep]
+        print(f'excluded sessions {args.exclude_session}: {keep.sum()} windows kept')
+
+    # 显式 train/test 目录划分 > 跨会话 > 随机
+    if split is not None and len(np.unique(split)) > 1:
+        val_mask = split == 'test'
+    else:
+        sessions = np.unique(session)
+        if len(sessions) > 1:
+            val_mask = session == sessions[-1]
+        else:
+            val_mask = np.random.default_rng(0).random(len(Y)) < 0.2
+    tr_mask = ~val_mask
+    print(f'train {tr_mask.sum()} / val {val_mask.sum()} windows, K={num_classes}')
+
+    train_dl = DataLoader(DenseDataset(X[tr_mask], Y[tr_mask], augment=True, drop=args.drop),
+                          batch_size=args.batch, shuffle=True)
+    val_dl = DataLoader(DenseDataset(X[val_mask], Y[val_mask]),
+                        batch_size=args.batch)
+
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    print('device:', device)
+    model = DenseGestureModel(num_classes, d_model=args.dmodel, layers=args.layers,
+                              dropout=args.dropout).to(device)
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f'params: {n_params:.2f}M')
+
+    criterion = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+
+    # 续训：从 last.pt 恢复模型/优化器/调度器/epoch 进度
+    start_ep = 0
+    if os.path.exists(args.last) and not args.reset:
+        ck = torch.load(args.last, map_location='cpu', weights_only=True)
+        # 只拦截影响权重形状的配置（dmodel/layers/num_classes）；
+        # dropout/drop 不改变形状，改了可无缝续训
+        if ck.get('dmodel', D_MODEL) != args.dmodel or ck.get('layers', 4) != args.layers \
+                or int(ck['num_classes']) != num_classes:
+            raise SystemExit(f'{args.last} 模型配置与当前参数不一致，如需重头训练请加 --reset')
+        model.load_state_dict(ck['model'])
+        opt.load_state_dict(ck['opt'])
+        sched.load_state_dict(ck['sched'])
+        start_ep = int(ck['epoch'])
+        print(f'续训: 从 epoch {start_ep} 继续 ({args.last})')
+
+    for ep in range(start_ep, args.epochs):
+        tl, ta = run_epoch(model, train_dl, device, criterion, opt)
+        vl, va = run_epoch(model, val_dl, device, criterion)
+        sched.step()
+        print(f'[ep{ep:03d}] train {tl:.3f}/{ta:.2f} | val {vl:.3f}/{va:.2f}')
+        # 每个 epoch 覆盖保存 last，随时可中断后续训
+        torch.save({'model': model.state_dict(), 'opt': opt.state_dict(),
+                    'sched': sched.state_dict(), 'epoch': ep + 1,
+                    'num_classes': num_classes, 'layers': args.layers,
+                    'dmodel': args.dmodel, 'dropout': args.dropout,
+                    'val_step_acc': va}, args.last)
+    print(f'done -> {args.last} | window-acc {window_acc(model, val_dl, device):.2f}')
+
+
+if __name__ == '__main__':
+    main()
