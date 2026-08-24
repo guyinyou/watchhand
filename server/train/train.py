@@ -12,7 +12,10 @@ Usage (project python 3.10):
 """
 
 import argparse
+import contextlib
 import os
+import signal
+import time
 
 import numpy as np
 import torch
@@ -23,6 +26,45 @@ from torch.utils.data import Dataset, DataLoader
 OUT_START, OUT_STRIDE = 48, 4                      # 后半窗口、~54ms 一步
 OUT_IDX = list(range(OUT_START, 96, OUT_STRIDE))   # 12 个密集输出步
 D_MODEL = 256
+
+
+@contextlib.contextmanager
+def no_interrupt():
+    """保存期间屏蔽 Ctrl+C：挂起时按下的 SIGINT 被记账，
+    保存完成后补发 KeyboardInterrupt，保证退出不丢失、文件不损坏。"""
+    if hasattr(signal, 'SIGINT') and signal.getsignal(signal.SIGINT) is signal.default_int_handler:
+        pending = []
+
+        def handler(signum, frame):
+            pending.append(True)
+
+        prev = signal.signal(signal.SIGINT, handler)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, prev)
+            if pending:
+                print('\nCtrl+C 在保存期间被拦截，保存已完成，现在退出')
+                raise KeyboardInterrupt
+    else:
+        yield
+
+
+def safe_save(ck, path):
+    """原子保存 + Windows 文件占用容错：
+    先写 tmp 再 rename；rename 被占用（杀毒/索引器/其他进程）时重试，
+    持续失败则落盘为备份名，绝不让保存失败打断训练。"""
+    tmp = path + '.tmp'
+    torch.save(ck, tmp)
+    for _ in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(1.0)
+    backup = f'{path}.ep{ck["epoch"]}'
+    os.replace(tmp, backup)
+    print(f'警告: {path} 被占用，本 epoch 检查点已存为 {backup}')
 
 
 # ------------------------------------------------------------ dataset
@@ -94,31 +136,38 @@ class DenseGestureModel(nn.Module):
                                            dropout=dropout, batch_first=True, norm_first=True)
         self.temporal = nn.TransformerEncoder(layer, num_layers=layers)
         self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, num_classes))
-        self._causal = torch.full((96, 96), float('-inf')).triu(1)
+        # register_buffer 随 model.to(device) 迁移，避免每次 forward 做 .to()；
+        # persistent=False 不进 state_dict，保证与旧 last.pt 续训兼容
+        self.register_buffer('_causal', torch.full((96, 96), float('-inf')).triu(1),
+                             persistent=False)
 
     def forward(self, x):
         f = self.frame_cnn(x).squeeze(2)                 # (B, D, 96)
         f = f.permute(0, 2, 1) + self.pos                # (B, 96, D)
-        h = self.temporal(f, mask=self._causal.to(x.device))
+        h = self.temporal(f, mask=self._causal)
         return self.head(h[:, OUT_IDX])                  # (B, 12, K)
 
 
 # ------------------------------------------------------------ training
 
-def run_epoch(model, loader, device, criterion, opt=None):
+def run_epoch(model, loader, device, criterion, opt=None, amp=False, scaler=None):
     train_mode = opt is not None
     model.train(train_mode)
     loss_sum, correct, total = 0.0, 0, 0
     with torch.set_grad_enabled(train_mode):
         for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)                            # (B, 12, K)
-            ys = y[:, OUT_IDX]
-            loss = criterion(logits.reshape(-1, logits.shape[-1]), ys.reshape(-1))
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            # amp 时前向+损失在 fp16 autocast 下算，反向由 scaler 防下溢
+            with torch.amp.autocast(device.type, enabled=amp):
+                logits = model(x)                            # (B, 12, K)
+                ys = y[:, OUT_IDX]
+                loss = criterion(logits.reshape(-1, logits.shape[-1]), ys.reshape(-1))
             if train_mode:
                 opt.zero_grad()
-                loss.backward()
-                opt.step()
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
             n = ys.numel()
             loss_sum += loss.item() * n
             with torch.no_grad():
@@ -149,6 +198,8 @@ def main():
     ap.add_argument('--classes', type=int, default=10,
                     help='输出分类数固定 10（当前数据不足 10 类时空类留位，后续加手势不用改结构）')
     ap.add_argument('--batch', type=int, default=32)
+    ap.add_argument('--workers', type=int, default=0,
+                    help='DataLoader 并行预处理进程数（cuda 下建议 2-4）')
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--wd', type=float, default=1e-3)
     ap.add_argument('--layers', type=int, default=4, help='transformer 层数 (2=small)')
@@ -157,6 +208,8 @@ def main():
     ap.add_argument('--drop', type=float, default=0.3,
                     help='训练时随机 drop 时间/距离段的概率（0 关闭）')
     ap.add_argument('--last', default='last.pt', help='每个 epoch 覆盖保存的续训检查点')
+    ap.add_argument('--amp', action='store_true',
+                    help='fp16 混合精度训练（仅 cuda 生效，Ampere 卡可再提速约 30-60%%）')
     ap.add_argument('--reset', action='store_true', help='忽略 last.pt 从头训练')
     ap.add_argument('--device', default=None, help='mps/cpu; auto-detect if omitted')
     ap.add_argument('--exclude-session', type=int, nargs='*', default=[],
@@ -189,16 +242,28 @@ def main():
     tr_mask = ~val_mask
     print(f'train {tr_mask.sum()} / val {val_mask.sum()} windows, K={num_classes}')
 
-    train_dl = DataLoader(DenseDataset(X[tr_mask], Y[tr_mask], augment=True, drop=args.drop),
-                          batch_size=args.batch, shuffle=True)
-    val_dl = DataLoader(DenseDataset(X[val_mask], Y[val_mask]),
-                        batch_size=args.batch)
-
     if args.device:
         device = torch.device(args.device)
     else:
         device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    print('device:', device)
+    if device.type == 'cuda':
+        # Ampere+ 显卡用 TF32 加速矩阵乘，对这种小模型精度影响可忽略
+        torch.set_float32_matmul_precision('high')
+    elif args.amp:
+        print('警告: --amp 仅 cuda 生效，当前设备忽略')
+    amp = args.amp and device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    print('device:', device, '| amp:', amp)
+
+    # num_workers>0 时增强/归一化在子进程并行做，pin_memory 加速 H2D 拷贝
+    pin = device.type == 'cuda'
+    common_dl_kwargs = dict(num_workers=args.workers, pin_memory=pin,
+                            persistent_workers=args.workers > 0)
+    train_dl = DataLoader(DenseDataset(X[tr_mask], Y[tr_mask], augment=True, drop=args.drop),
+                          batch_size=args.batch, shuffle=True, **common_dl_kwargs)
+    val_dl = DataLoader(DenseDataset(X[val_mask], Y[val_mask]),
+                        batch_size=args.batch, **common_dl_kwargs)
+
     model = DenseGestureModel(num_classes, d_model=args.dmodel, layers=args.layers,
                               dropout=args.dropout).to(device)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -224,16 +289,19 @@ def main():
         print(f'续训: 从 epoch {start_ep} 继续 ({args.last})')
 
     for ep in range(start_ep, args.epochs):
-        tl, ta = run_epoch(model, train_dl, device, criterion, opt)
-        vl, va = run_epoch(model, val_dl, device, criterion)
+        tl, ta = run_epoch(model, train_dl, device, criterion, opt, amp=amp, scaler=scaler)
+        vl, va = run_epoch(model, val_dl, device, criterion, amp=amp, scaler=scaler)
         sched.step()
         print(f'[ep{ep:03d}] train {tl:.3f}/{ta:.2f} | val {vl:.3f}/{va:.2f}')
         # 每个 epoch 覆盖保存 last，随时可中断后续训
-        torch.save({'model': model.state_dict(), 'opt': opt.state_dict(),
-                    'sched': sched.state_dict(), 'epoch': ep + 1,
-                    'num_classes': num_classes, 'layers': args.layers,
-                    'dmodel': args.dmodel, 'dropout': args.dropout,
-                    'val_step_acc': va}, args.last)
+        # Ctrl+C 与保存互斥 + 原子写盘：中断要么发生在保存前，要么在保存后
+        with no_interrupt():
+            ck = {'model': model.state_dict(), 'opt': opt.state_dict(),
+                  'sched': sched.state_dict(), 'epoch': ep + 1,
+                  'num_classes': num_classes, 'layers': args.layers,
+                  'dmodel': args.dmodel, 'dropout': args.dropout,
+                  'val_step_acc': va}
+            safe_save(ck, args.last)
     print(f'done -> {args.last} | window-acc {window_acc(model, val_dl, device):.2f}')
 
 

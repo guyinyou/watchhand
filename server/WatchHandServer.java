@@ -485,13 +485,16 @@ public class WatchHandServer {
             if (timers[0] != null) timers[0].stop();
             if (timers[1] != null) timers[1].stop();
             stopCollection();
+            // 录制并保存完成后再发声提示，此时声音不会再录入数据
+            java.awt.Toolkit.getDefaultToolkit().beep();
             guidedBtn.setText("Start Guided Collection");
             guidedBtn.setBackground(null);
             classesField.setEditable(true); trialSecField.setEditable(true);
             roundsField.setEditable(true);
             collectBtn.setEnabled(true);
-            labelDisplay.setText("Label: 0");
-            labelDisplay.setBackground(Color.DARK_GRAY);
+            // setLabel 同时复位 currentLabel 状态，避免残留到下次采集
+            // （此时已 stopCollection，不会误记标签事件）
+            setLabel(0);
         };
 
         final Runnable[] nextTrial = new Runnable[1];
@@ -500,8 +503,9 @@ public class WatchHandServer {
             if (idx[0] >= seqHolder[0].size()) { finishGuided.run(); return; }
             int lab = seqHolder[0].get(idx[0]);
             double trialSec = parseD(trialSecField.getText(), 2.5);
-            java.awt.Toolkit.getDefaultToolkit().beep();
-            recordLabelEvent(lab);
+            // 不发声：beep 会被麦克风录入数据，改为结束后统一提示
+            // 标签未变化时不重复记录（首个 trial 与准备期同类，避免冗余行）
+            if (lab != currentLabel) recordLabelEvent(lab);
             timers[0] = new javax.swing.Timer((int) (trialSec * 1000), ev -> {
                 idx[0]++;
                 // 无 rest、边界不插 0：标签在 trial 切换点直接跳到下一类
@@ -531,6 +535,9 @@ public class WatchHandServer {
             for (int r = 0; r < rounds; r++) seq.addAll(classes);
             seqHolder[0] = seq;
             idx[0] = 0;
+            // 先显式置为第一类（此时未采集，仅更新状态和显示），
+            // 保证 startCollection 的初始事件确定是 {0, 第一类}，不残留上次的标签
+            recordLabelEvent(classes.get(0));
             try {
                 startCollection();
             } catch (IOException ex) {
@@ -543,7 +550,7 @@ public class WatchHandServer {
             classesField.setEditable(false); trialSecField.setEditable(false);
             roundsField.setEditable(false);
             collectBtn.setEnabled(false);
-            recordLabelEvent(0);
+            // 准备期保持第一类标签，不再插入 0（避免开头 N->0->N 重置首个窗口）
             timers[0] = new javax.swing.Timer(2000, ev -> nextTrial[0].run());
             timers[0].setRepeats(false);
             timers[0].start();

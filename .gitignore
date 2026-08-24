@@ -31,3 +31,7 @@ server/train/profile_cache/
 server/train/__pycache__/
 server/__pycache__/
 *.pyc
+
+# 损坏/临时检查点（不可加载，勿入库）
+server/train/last_corrupt_*
+*.pt.tmp
