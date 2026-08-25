@@ -22,7 +22,7 @@
 ```
 
 - **APK**（`app/`）：FMCW 播放 + 录音 + TCP 流式上传 + 本地热力图。连接与流媒体状态分离，连接后自动开始流。
-- **Java 服务端**（`server/WatchHandServer.java`）：逐 chirp 分段相关的流式回声轮廓、Swing 热力图、引导式采集（beep 提示 + 自动标签）、ONNX Runtime 实时预测。
+- **Java 服务端**（`server/WatchHandServer.java`）：逐 chirp 分段相关的流式回声轮廓、Swing 热力图、引导式循环采集（按 trial 自动切类写标签；trial 间静默、结束才 beep，避免录入提示音）、ONNX Runtime 实时预测。
 - **训练管线**（`server/train/`）：见下。
 
 ## 快速开始
@@ -35,7 +35,8 @@ cd server && ./start_server.sh            # 默认端口 9999
 ./build_apk.sh --install <device-serial>
 
 # 3. 采集：服务端 UI 勾选 test set 决定存 train/ 或 test/；
-#    classes 填 "0,1,2" = 混合会话（进 train/），单类会话进 test/
+#    classes 填 "0,1,2" = 混合会话（进 train/，0=手放平的 rest trial），
+#    单类会话进 test/；2s 准备期标签=第一类，类别变化才写标签事件
 
 # 4. 迭代训练（python 3.10）
 cd server/train

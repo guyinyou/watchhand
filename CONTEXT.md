@@ -58,8 +58,10 @@ server/
 
 ## 5. 采集与划分协议
 
-- 引导式循环采集：classes 列表（**train 用 "0,1,2" 混合**，0=rest trial）、trial 2.5s、rounds 可配、test set 复选框决定目录。
-- **边界不插零长度 0 事件**（用户要求；训练不需要 mask）；仅启动后 2s 准备期为 0。
+- 引导式循环采集：classes 列表（**train 用 "0,1,2" 混合**；0 作为 rest 类只有写进列表才有，代表"手放平"trial）、trial 默认 2.5s、rounds 可配、test set 复选框决定目录。
+- **2s 准备期标签 = 第一类**（不是 0，避免开头 N→0→N 重置首个窗口）。
+- **标签事件仅在类别变化时记录**（`lab != currentLabel` 才写事件）：边界无零长度 0，连续同类 trial 无中间事件；训练不需要 mask。
+- **trial 间不发声**（beep 会被麦克风录进数据），仅在保存完成后 beep 一次。
 - **划分**：train/ = 混合会话，test/ = 单类会话。
 - 数据三件套 .raw/.labels/.meta；历史带边界标记的 .labels 已清洗。
 

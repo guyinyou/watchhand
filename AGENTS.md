@@ -87,7 +87,7 @@ FmcwGenerator → AudioManager → EchoProfileProcessor → MainActivity (Compos
 
 - **Java 服务端**（server/WatchHandServer.java，唯一处理端）：流式轮廓 + Swing 热力图 + 引导式采集 UI + ONNX Runtime 实时预测（Pred label，每 2 帧推理取末步 argmax）。编译 `javac -cp "lib/*" WatchHandServer.java`，启动 `./start_server.sh`。
 - **训练管线**（server/train/）：extract.py（整段 FFT 互相关 + p_start 对齐 + 双通道 + 滑窗 stride 22 + 会话级缓存，无设备校准）→ train.py（帧 CNN + 因果 Transformer，默认 3.74M，10 类 × 12 密集步，last.pt 原子保存自动续训）→ test.py（--split）→ export_onnx.py；`run_pipeline.sh` 一键串联。
-- **采集协议**：train/ 放混合会话（classes "0,1,2"），test/ 放单类会话；边界不插 0；无 mask。
+- **采集协议**：train/ 放混合会话（classes "0,1,2"，0=rest trial），test/ 放单类会话；2s 准备期标签=第一类；标签事件仅在类别变化时记录（边界无零长度 0）；trial 间不 beep（结束才发声）；训练无 mask。
 
 ## Pending Work (from CONTEXT.md)
 
