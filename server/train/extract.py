@@ -170,8 +170,8 @@ def frame_labels(events, n_frames, L):
     return y
 
 
-def make_window(P, f0):
-    orig = P[:, f0:f0 + WINDOW_FRAMES]
+def make_window(P, f0, wf):
+    orig = P[:, f0:f0 + wf]
     diff = np.abs(orig)[:, 1:] - np.abs(orig)[:, :-1]
     diff = np.concatenate([diff, diff[:, -1:]], axis=1)
     return np.stack([orig, diff], axis=0).astype(np.float32)
@@ -181,8 +181,14 @@ def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument('out', nargs='?', default='dataset.npz')
+    ap.add_argument('--window', type=int, default=WINDOW_FRAMES,
+                    help='窗口帧数（默认 96；如 32 帧短窗实验）')
+    ap.add_argument('--stride', type=int, default=STRIDE_FRAMES,
+                    help='滑窗步长（默认 22）')
     args = ap.parse_args()
     out_path = args.out
+    wf, sf = args.window, args.stride
+    print(f'窗口 {wf} 帧 / 步长 {sf} 帧')
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'collected_data')
 
     X_all, Y_all, S_all, split_all = [], [], [], []
@@ -201,9 +207,9 @@ def main():
         print(f'{os.path.basename(base)}: {n_frames} frames')
 
         wins = []
-        for f0 in range(0, n_frames - WINDOW_FRAMES + 1, STRIDE_FRAMES):
-            wins.append((make_window(P, f0),
-                         y_tl[f0:f0 + WINDOW_FRAMES].copy()))
+        for f0 in range(0, n_frames - wf + 1, sf):
+            wins.append((make_window(P, f0, wf),
+                         y_tl[f0:f0 + wf].copy()))
 
         for w, yw in wins:
             X_all.append(w)

@@ -20,6 +20,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--last', default='last.pt')
     ap.add_argument('--out', default='last.onnx')
+    ap.add_argument('--window', type=int, default=96,
+                    help='输入窗口帧数（需与训练数据一致，如 32）')
     args = ap.parse_args()
 
     ck = torch.load(args.last, map_location='cpu', weights_only=True)
@@ -32,7 +34,7 @@ def main():
     model.load_state_dict(ck['model'])
     model.eval()
 
-    x = torch.randn(1, 2, 64, 96)
+    x = torch.randn(1, 2, 64, args.window)
     torch.onnx.export(model, x, args.out,
                       input_names=['x'], output_names=['logits'],
                       opset_version=14, dynamic_axes={'x': {0: 'batch'},

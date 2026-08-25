@@ -10,6 +10,7 @@ import java.nio.ByteOrder;
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtSession;
+import ai.onnxruntime.TensorInfo;
 
 /**
  * WatchHand Java Server - TCP receiver with Swing visualization.
@@ -26,7 +27,8 @@ public class WatchHandServer {
     static final double F_MIN = 18000.0;
     static final double F_MAX = 20000.0;
     static final int DISTANCE_BINS = 60;
-    static final int TIME_WINDOW_FRAMES = 96;
+    /** 时间窗口帧数：加载 ONNX 时从模型输入形状自动适配（换 32 帧模型无需改代码）；未启用预测时默认 96 */
+    static int timeWindowFrames = 96;
 
     /** Chirp 长度：588 samples = 13.333ms @ 统一 44.1kHz，帧率 75fps（与客户端 AudioManager.CHIRP_LENGTH 保持同步） */
     static final int CHIRP_LENGTH = 588;
@@ -133,7 +135,7 @@ public class WatchHandServer {
 
                     // Initialize processor (统一 44.1kHz，chirp 588 samples，与客户端一致)
                     EchoProfileProcessor processor = new EchoProfileProcessor(
-                        sampleRate, F_MIN, F_MAX, CHIRP_LENGTH, DISTANCE_BINS, TIME_WINDOW_FRAMES
+                        sampleRate, F_MIN, F_MAX, CHIRP_LENGTH, DISTANCE_BINS, timeWindowFrames
                     );
                     System.out.println("Processor initialized (chirp=" + CHIRP_LENGTH + " samples). Waiting for data...");
 
@@ -153,7 +155,7 @@ public class WatchHandServer {
                         long now = System.currentTimeMillis();
                         if (now - lastByteTime > 500) {
                             processor = new EchoProfileProcessor(
-                                sampleRate, F_MIN, F_MAX, CHIRP_LENGTH, DISTANCE_BINS, TIME_WINDOW_FRAMES);
+                                sampleRate, F_MIN, F_MAX, CHIRP_LENGTH, DISTANCE_BINS, timeWindowFrames);
                             System.out.println("Stream gap " + (now - lastByteTime) + "ms: processor realigned to new audio session");
                         }
                         lastByteTime = now;
@@ -177,9 +179,9 @@ public class WatchHandServer {
                         if (result != null) {
                             float[][] origCopy;
                             synchronized (dataLock) {
-                                originalProfile = result[0] != null ? reshapeTo2D(result[0], DISTANCE_BINS, TIME_WINDOW_FRAMES) : null;
-                                diffProfile = result[1] != null ? reshapeTo2D(result[1], DISTANCE_BINS, TIME_WINDOW_FRAMES - 1) : null;
-                                frameCount = TIME_WINDOW_FRAMES;
+                                originalProfile = result[0] != null ? reshapeTo2D(result[0], DISTANCE_BINS, timeWindowFrames) : null;
+                                diffProfile = result[1] != null ? reshapeTo2D(result[1], DISTANCE_BINS, timeWindowFrames - 1) : null;
+                                frameCount = timeWindowFrames;
                                 origCopy = originalProfile;
                             }
 
@@ -283,7 +285,7 @@ public class WatchHandServer {
             metaOut.println("chirp_length=" + CHIRP_LENGTH);
             metaOut.println("chirp_duration_ms=" + String.format(java.util.Locale.US, "%.3f", CHIRP_LENGTH * 1000.0 / sampleRateForSave));
             metaOut.println("distance_bins=" + DISTANCE_BINS);
-            metaOut.println("time_window_frames=" + TIME_WINDOW_FRAMES);
+            metaOut.println("time_window_frames=" + timeWindowFrames);
             metaOut.println("started_at=" + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date(collectionStartMs)));
 
             System.out.println("Saved " + numSamples + " raw samples (" + String.format("%.1f", bytes / 1e6) + " MB)");
@@ -332,7 +334,12 @@ public class WatchHandServer {
         try {
             ortEnv = OrtEnvironment.getEnvironment();
             ortSession = ortEnv.createSession(path, new OrtSession.SessionOptions());
-            System.out.println("Predictor loaded: " + path);
+            // 窗口长度自适应：从模型输入形状 [batch, 2, 64, T] 反查 T（导出时仅 batch 为动态轴）
+            try {
+                long[] shape = ((TensorInfo) ortSession.getInputInfo().get("x").getInfo()).getShape();
+                if (shape.length == 4 && shape[3] > 0) timeWindowFrames = (int) shape[3];
+            } catch (Exception ignore) { }
+            System.out.println("Predictor loaded: " + path + " | 输入窗口 T=" + timeWindowFrames + " 帧");
         } catch (Exception e) {
             System.out.println("Predictor load failed: " + e.getMessage());
             ortSession = null;
@@ -352,9 +359,9 @@ public class WatchHandServer {
         return best;
     }
 
-    /** 构造与 train.py 推理一致的双通道归一化输入 [2][64][96]。 */
+    /** 构造与 train.py 推理一致的双通道归一化输入 [2][64][T]（T=模型窗口帧数）。 */
     static float[][][] buildInput(float[][] orig) {
-        int bins = DISTANCE_BINS, T = TIME_WINDOW_FRAMES, pad = 64;
+        int bins = DISTANCE_BINS, T = timeWindowFrames, pad = 64;
         float[][][] x = new float[2][pad][T];
         // 通道 0：原始轮廓（edge pad）
         for (int d = 0; d < pad; d++) {

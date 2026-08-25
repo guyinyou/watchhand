@@ -73,16 +73,18 @@ def safe_save(ck, path):
 # ------------------------------------------------------------ dataset
 
 class DenseDataset(Dataset):
-    """2x60x96 窗口 -> 距离轴 pad 到 64，窗口内逐通道归一化（论文 3.3.2）。"""
+    """2x60xT 窗口（T=窗口帧数，由数据集决定）-> 距离轴 pad 到 64，窗口内逐通道归一化（论文 3.3.2）。"""
 
     def __init__(self, X, Y, augment=False, drop=0.0, win_label=False, rng=None):
         self.X = np.pad(X, ((0, 0), (0, 0), (0, 4), (0, 0)), mode='edge')
         self.Y = Y
-        # win_label=True 时返回窗口级单标签（后半窗多数表决，numpy 算好，MPS 无 mode 算子）
+        # win_label=True 时返回窗口级单标签（取窗口最后一帧：推理时窗口末端即"当前时刻"，
+        # 与实时预测语义一致，手势切换无表决滞后）
         self.win_label = win_label
         self.augment = augment
         self.drop = drop
         self.rng = rng or np.random.default_rng()
+        self.T = self.X.shape[-1]   # 时间轴帧数（窗口长度），增强/标签逻辑据此自适应
 
     def __len__(self):
         return len(self.Y)
@@ -108,8 +110,9 @@ class DenseDataset(Dataset):
             # drop 机制：随机抹掉时间/距离段（SpecAugment 式），
             # 迫使模型不依赖局部纹理性过拟合
             if self.drop > 0 and r.random() < self.drop:
-                t0 = int(r.integers(0, 96 - 15))
-                x[:, :, t0:t0 + int(r.integers(5, 16))] = 0
+                ml = min(int(r.integers(5, 16)), self.T - 1)   # 抹掉一段，长度不超过窗口
+                t0 = int(r.integers(0, self.T - ml + 1))
+                x[:, :, t0:t0 + ml] = 0
             if self.drop > 0 and r.random() < self.drop:
                 d0 = int(r.integers(0, 64 - 10))
                 x[:, d0:d0 + int(r.integers(5, 11)), :] = 0
@@ -118,7 +121,7 @@ class DenseDataset(Dataset):
             mu, sd = x[c].mean(), x[c].std()
             x[c] = (x[c] - mu) / (sd + 1e-6)
         if self.win_label:
-            lab = int(np.bincount(self.Y[i][48:]).argmax())
+            lab = int(self.Y[i][-1])   # 最后一帧标签，对齐推理时"预测当前手势"语义
             return (torch.from_numpy(x.astype(np.float32)),
                     torch.tensor(lab, dtype=torch.long))
         return (torch.from_numpy(x.astype(np.float32)),
