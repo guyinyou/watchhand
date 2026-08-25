@@ -73,9 +73,11 @@ def safe_save(ck, path):
 # ------------------------------------------------------------ dataset
 
 class DenseDataset(Dataset):
-    """2x60xT 窗口（T=窗口帧数，由数据集决定）-> 距离轴 pad 到 64，窗口内逐通道归一化（论文 3.3.2）。"""
+    """2x60xT 窗口（T=窗口帧数，由数据集决定）-> 距离轴 pad 到 64。
+    归一化已移到 device 侧向量化执行（见 normalize_batch），这里只吐增强后的原始值。"""
 
-    def __init__(self, X, Y, augment=False, drop=0.0, win_label=False, rng=None):
+    def __init__(self, X, Y, augment=False, drop=0.0, win_label=False, rng=None,
+                 cache_epochs=0):
         self.X = np.pad(X, ((0, 0), (0, 0), (0, 4), (0, 0)), mode='edge')
         self.Y = Y
         # win_label=True 时返回窗口级单标签（取窗口最后一帧：推理时窗口末端即"当前时刻"，
@@ -85,6 +87,12 @@ class DenseDataset(Dataset):
         self.drop = drop
         self.rng = rng or np.random.default_rng()
         self.T = self.X.shape[-1]   # 时间轴帧数（窗口长度），增强/标签逻辑据此自适应
+        # 增强缓存：每 cache_epochs 个 epoch 向量化重生成一次全量增强（worker 各自独立计数）；
+        # 期间访问纯索引读取。0 = 传统每样本在线增强（每 epoch 重新随机）
+        self.cache_epochs = cache_epochs if augment else 0
+        self.X_aug = None
+        self._calls = 0
+        self._next_refresh = 0
 
     def __len__(self):
         return len(self.Y)
@@ -97,35 +105,92 @@ class DenseDataset(Dataset):
             out[:, :n - s] = w[:, s:]
         elif s < 0:
             out[:, -s:] = w[:, :n + s]
+        else:
+            out[:] = w                       # s=0 恒等变换（旧版此处误返全零）
         return out
 
     def __getitem__(self, i):
-        x = self.X[i].copy()
-        if self.augment:
-            r = self.rng
-            # 距离轴小位移（残差漂移）+ 幅度抖动
-            x = self._shift_zero(x, int(r.integers(-2, 3)))
-            if r.random() < 0.8:
-                x *= r.uniform(0.95, 1.05)
-            # drop 机制：随机抹掉时间/距离段（SpecAugment 式），
-            # 迫使模型不依赖局部纹理性过拟合
-            if self.drop > 0 and r.random() < self.drop:
-                ml = min(int(r.integers(5, 16)), self.T - 1)   # 抹掉一段，长度不超过窗口
-                t0 = int(r.integers(0, self.T - ml + 1))
-                x[:, :, t0:t0 + ml] = 0
-            if self.drop > 0 and r.random() < self.drop:
-                d0 = int(r.integers(0, 64 - 10))
-                x[:, d0:d0 + int(r.integers(5, 11)), :] = 0
-        # 窗口内归一化（论文 3.3.2）
-        for c in range(x.shape[0]):
-            mu, sd = x[c].mean(), x[c].std()
-            x[c] = (x[c] - mu) / (sd + 1e-6)
+        if self.cache_epochs > 0:
+            # 增强缓存路径：每 N epoch 刷新一次向量化增强缓存（worker 各自独立），
+            # 其余访问纯索引读取，免去逐样本增强开销
+            self._calls += 1
+            if self.X_aug is None or self._calls >= self._next_refresh:
+                self._refresh_augment()
+            x = self.X_aug[i].copy()
+        else:
+            x = self.X[i].copy()
+            if self.augment:
+                r = self.rng
+                # 距离轴小位移（残差漂移）+ 幅度抖动
+                x = self._shift_zero(x, int(r.integers(-2, 3)))
+                if r.random() < 0.8:
+                    x *= r.uniform(0.95, 1.05)
+                # drop 机制：随机抹掉时间/距离段（SpecAugment 式），
+                # 迫使模型不依赖局部纹理性过拟合
+                if self.drop > 0 and r.random() < self.drop:
+                    ml = min(int(r.integers(5, 16)), self.T - 1)   # 抹掉一段，长度不超过窗口
+                    t0 = int(r.integers(0, self.T - ml + 1))
+                    x[:, :, t0:t0 + ml] = 0
+                if self.drop > 0 and r.random() < self.drop:
+                    d0 = int(r.integers(0, 64 - 10))
+                    x[:, d0:d0 + int(r.integers(5, 11)), :] = 0
+        # 归一化在 device 侧向量化做（normalize_batch）；x 本就是 float32，
+        # 无需 astype 拷贝（ascontiguousarray 对连续数组是 no-op）
+        xt = torch.from_numpy(np.ascontiguousarray(x))
         if self.win_label:
             lab = int(self.Y[i][-1])   # 最后一帧标签，对齐推理时"预测当前手势"语义
-            return (torch.from_numpy(x.astype(np.float32)),
-                    torch.tensor(lab, dtype=torch.long))
-        return (torch.from_numpy(x.astype(np.float32)),
-                torch.tensor(self.Y[i], dtype=torch.long))
+            return xt, torch.tensor(lab, dtype=torch.long)
+        return xt, torch.tensor(self.Y[i], dtype=torch.long)
+
+    def _refresh_augment(self):
+        """numpy 向量化重生成全量增强缓存，语义与逐样本在线增强一致
+        （距离平移/幅度抖动/时间距离 drop）。每 N 个 epoch 一次，
+        把增强开销从每次访问摊薄到每 N epoch。"""
+        r = self.rng
+        x = self.X.copy()                              # (N, 2, 64, T) float32
+        N, _, D, T = x.shape
+        # ① 距离轴平移：out[d] = X[d+s]，越界补 0，s ∈ [-2, 2]（按档位原地搬移）
+        s = r.integers(-2, 3, N)
+        for sv in (-2, -1, 1, 2):
+            m = s == sv
+            if not m.any():
+                continue
+            if sv > 0:
+                x[m, :, :D - sv] = x[m, :, sv:]
+                x[m, :, D - sv:] = 0
+            else:
+                x[m, :, -sv:] = x[m, :, :D + sv]
+                x[m, :, :-sv] = 0
+        # ② 幅度抖动：80% 概率 × [0.95, 1.05)
+        k = np.where(r.random(N) < 0.8, r.uniform(0.95, 1.05, N), 1.0)
+        x *= k.astype(np.float32)[:, None, None, None]
+        if self.drop > 0:
+            # ③ 时间段 drop：长度 5-16 且不超过窗口
+            on = r.random(N) < self.drop
+            if on.any():
+                ml = np.minimum(r.integers(5, 16, N), T - 1)
+                t0 = (r.random(N) * (T - ml + 1)).astype(np.int64)
+                t_idx = np.arange(T)[None, :]
+                mask = on[:, None] & (t_idx >= t0[:, None]) & (t_idx < (t0 + ml)[:, None])
+                x *= (~mask)[:, None, None, :]
+            # ④ 距离段 drop：长度 5-11
+            on = r.random(N) < self.drop
+            if on.any():
+                d0 = r.integers(0, D - 10, N)
+                dl = r.integers(5, 11, N)
+                d_idx = np.arange(D)[None, :]
+                mask = on[:, None] & (d_idx >= d0[:, None]) & (d_idx < (d0 + dl)[:, None])
+                x *= (~mask)[:, None, :, None]
+        self.X_aug = x
+        self._next_refresh = self._calls + len(self.Y) * self.cache_epochs
+
+
+def normalize_batch(x):
+    """窗口内逐样本逐通道归一化（论文 3.3.2），batch 上 device 后一次算完：
+    (v - mean) / (std + 1e-6)，统计量为整窗均值/标准差（与原 numpy 逐样本版语义一致）。"""
+    mu = x.mean(dim=(2, 3), keepdim=True)
+    sd = x.std(dim=(2, 3), keepdim=True, unbiased=False) + 1e-6
+    return (x - mu) / sd
 
 
 # ------------------------------------------------------------ model
@@ -235,6 +300,7 @@ def run_epoch(model, loader, device, criterion, opt=None, amp=False, scaler=None
     with torch.set_grad_enabled(train_mode):
         for x, y in loader:
             x = x.to(device, non_blocking=True)
+            x = normalize_batch(x)                     # 归一化在 device 上向量化，替代逐样本 numpy
             y = y.to(device, non_blocking=True)
             # amp 时前向+损失在 fp16 autocast 下算，反向由 scaler 防下溢
             with torch.amp.autocast(device.type, enabled=amp):
@@ -298,6 +364,9 @@ def main():
     ap.add_argument('--dropout', type=float, default=0.2)
     ap.add_argument('--drop', type=float, default=0.3,
                     help='训练时随机 drop 时间/距离段的概率（0 关闭）')
+    ap.add_argument('--aug-cache', type=int, default=0,
+                    help='每 N 个 epoch 刷新一次数据增强缓存（向量化整批增强，访问纯索引读取）；'
+                         '0（默认）= 每样本在线增强（每 epoch 重新随机）')
     ap.add_argument('--last', default='last.pt', help='每个 epoch 覆盖保存的续训检查点')
     ap.add_argument('--amp', action='store_true',
                     help='fp16 混合精度训练（仅 cuda 生效，Ampere 卡可再提速约 30-60%%）')
@@ -352,7 +421,7 @@ def main():
     common_dl_kwargs = dict(num_workers=args.workers, pin_memory=pin,
                             persistent_workers=args.workers > 0)
     train_dl = DataLoader(DenseDataset(X[tr_mask], Y[tr_mask], augment=True, drop=args.drop,
-                                       win_label=not dense),
+                                       win_label=not dense, cache_epochs=args.aug_cache),
                           batch_size=args.batch, shuffle=True, **common_dl_kwargs)
     val_dl = DataLoader(DenseDataset(X[val_mask], Y[val_mask], win_label=not dense),
                         batch_size=args.batch, **common_dl_kwargs)

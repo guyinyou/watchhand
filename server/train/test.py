@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from train import build_model, DenseDataset, OUT_IDX
+from train import build_model, DenseDataset, OUT_IDX, normalize_batch
 
 
 def main():
@@ -70,6 +70,7 @@ def main():
     with torch.no_grad():
         for x, y in test_dl:
             x = x.to(device, non_blocking=True)
+            x = normalize_batch(x)                     # 归一化与 train.py 一致，在 device 上向量化
             pred = model(x).argmax(-1)
             if dense:
                 pred_list.append(pred.cpu().numpy())       # (B, 12)
