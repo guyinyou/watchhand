@@ -20,7 +20,10 @@ import time
 import numpy as np
 import torch
 
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")  # timm 预训练权重走镜像
+
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 OUT_START, OUT_STRIDE = 48, 4                      # 后半窗口、~54ms 一步
@@ -72,9 +75,11 @@ def safe_save(ck, path):
 class DenseDataset(Dataset):
     """2x60x96 窗口 -> 距离轴 pad 到 64，窗口内逐通道归一化（论文 3.3.2）。"""
 
-    def __init__(self, X, Y, augment=False, drop=0.0, rng=None):
+    def __init__(self, X, Y, augment=False, drop=0.0, win_label=False, rng=None):
         self.X = np.pad(X, ((0, 0), (0, 0), (0, 4), (0, 0)), mode='edge')
         self.Y = Y
+        # win_label=True 时返回窗口级单标签（后半窗多数表决，numpy 算好，MPS 无 mode 算子）
+        self.win_label = win_label
         self.augment = augment
         self.drop = drop
         self.rng = rng or np.random.default_rng()
@@ -112,6 +117,10 @@ class DenseDataset(Dataset):
         for c in range(x.shape[0]):
             mu, sd = x[c].mean(), x[c].std()
             x[c] = (x[c] - mu) / (sd + 1e-6)
+        if self.win_label:
+            lab = int(np.bincount(self.Y[i][48:]).argmax())
+            return (torch.from_numpy(x.astype(np.float32)),
+                    torch.tensor(lab, dtype=torch.long))
         return (torch.from_numpy(x.astype(np.float32)),
                 torch.tensor(self.Y[i], dtype=torch.long))
 
@@ -148,9 +157,75 @@ class DenseGestureModel(nn.Module):
         return self.head(h[:, OUT_IDX])                  # (B, 12, K)
 
 
+class _CausalDilatedBlock(nn.Module):
+    """因果空洞卷积残差块：左侧补 2*dilation 保证只看过去。"""
+
+    def __init__(self, d, dil, dropout):
+        super().__init__()
+        self.pad = 2 * dil
+        self.conv = nn.Conv1d(d, d, 3, dilation=dil)
+        self.bn = nn.BatchNorm1d(d)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = F.pad(x, (self.pad, 0))
+        h = self.conv(h)
+        return x + self.drop(F.relu(self.bn(h)))
+
+
+class CnnDenseModel(nn.Module):
+    """帧 CNN + 因果空洞 1D 卷积时间栈 + 密集头。
+    用空洞卷积替代 Transformer 的 96² 注意力，MPS 上快数倍；
+    空洞循环 (1,2,4,8) 堆叠感受野，layers=8 时覆盖 ~61 帧历史。"""
+
+    def __init__(self, num_classes, d_model=D_MODEL, layers=8, dropout=0.2):
+        super().__init__()
+        self.frame_cnn = nn.Sequential(
+            nn.Conv2d(2, 64, 3, stride=(2, 1), padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 128, 3, stride=(2, 1), padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128, d_model, 3, stride=(2, 1), padding=1), nn.BatchNorm2d(d_model), nn.ReLU(),
+            nn.AvgPool2d(kernel_size=(8, 1)),
+        )
+        self.temporal = nn.Sequential(*[
+            _CausalDilatedBlock(d_model, 2 ** (i % 4), dropout) for i in range(layers)
+        ])
+        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, num_classes))
+
+    def forward(self, x):
+        f = self.frame_cnn(x).squeeze(2)                 # (B, D, 96)
+        h = self.temporal(f)                             # (B, D, 96) 因果
+        return self.head(h.permute(0, 2, 1)[:, OUT_IDX])  # (B, 12, K)
+
+
+class FastViTModel(nn.Module):
+    """论文同款主干：FastViT-T12（ImageNet 预训练，卷积为主快而稳）。
+    整窗 2×64×96 当时空图像一次前向，全局池化 → 10 类头，窗口级单标签。"""
+
+    def __init__(self, num_classes, dropout=0.2, pretrained=True):
+        super().__init__()
+        import timm
+        self.backbone = timm.create_model('fastvit_t12', pretrained=pretrained,
+                                          in_chans=2, num_classes=0)
+        d = self.backbone.num_features
+        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d, num_classes))
+
+    def forward(self, x):
+        return self.head(self.backbone(x))                 # (B, K)
+
+
+def build_model(arch, num_classes, d_model, layers, dropout):
+    if arch == 'cnn':
+        return CnnDenseModel(num_classes, d_model=d_model, layers=layers, dropout=dropout)
+    if arch == 'fastvit':
+        return FastViTModel(num_classes, dropout=dropout)
+    return DenseGestureModel(num_classes, d_model=d_model, layers=layers, dropout=dropout)
+
+
 # ------------------------------------------------------------ training
 
-def run_epoch(model, loader, device, criterion, opt=None, amp=False, scaler=None):
+def run_epoch(model, loader, device, criterion, opt=None, amp=False, scaler=None, dense=True):
     train_mode = opt is not None
     model.train(train_mode)
     loss_sum, correct, total = 0.0, 0, 0
@@ -160,9 +235,13 @@ def run_epoch(model, loader, device, criterion, opt=None, amp=False, scaler=None
             y = y.to(device, non_blocking=True)
             # amp 时前向+损失在 fp16 autocast 下算，反向由 scaler 防下溢
             with torch.amp.autocast(device.type, enabled=amp):
-                logits = model(x)                            # (B, 12, K)
-                ys = y[:, OUT_IDX]
-                loss = criterion(logits.reshape(-1, logits.shape[-1]), ys.reshape(-1))
+                logits = model(x)
+                if dense:
+                    ys = y[:, OUT_IDX]                       # (B,12) 密集步
+                    loss = criterion(logits.reshape(-1, logits.shape[-1]), ys.reshape(-1))
+                else:
+                    ys = y                                     # (B,) 数据集已给窗口标签
+                    loss = criterion(logits, ys)
             if train_mode:
                 opt.zero_grad()
                 scaler.scale(loss).backward()
@@ -176,18 +255,23 @@ def run_epoch(model, loader, device, criterion, opt=None, amp=False, scaler=None
     return loss_sum / max(total, 1), correct / max(total, 1)
 
 
-def window_acc(model, loader, device):
-    """窗口级多数表决准确率。"""
+def window_acc(model, loader, device, dense=True):
+    """窗口级准确率：dense=12 步多数表决；单标签=argmax vs 后半窗多数标签。"""
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            pred = model(x).argmax(-1)                   # (B, 12)
-            for p, t in zip(pred, y[:, OUT_IDX]):
-                pv, tv = p.cpu().numpy(), t.cpu().numpy()
-                correct += np.bincount(pv).argmax() == np.bincount(tv).argmax()
-                total += 1
+            pred = model(x).argmax(-1)
+            if dense:
+                for p, t in zip(pred, y[:, OUT_IDX]):
+                    pv, tv = p.cpu().numpy(), t.cpu().numpy()
+                    correct += np.bincount(pv).argmax() == np.bincount(tv).argmax()
+                    total += 1
+            else:
+                tw = y                                         # (B,) 窗口标签
+                correct += (pred == tw).sum().item()
+                total += len(tw)
     return correct / max(total, 1)
 
 
@@ -202,7 +286,11 @@ def main():
                     help='DataLoader 并行预处理进程数（cuda 下建议 2-4）')
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--wd', type=float, default=1e-3)
-    ap.add_argument('--layers', type=int, default=4, help='transformer 层数 (2=small)')
+    ap.add_argument('--layers', type=int, default=4, help='transformer 层数 (2=small)；cnn 架构下为空洞块数（推荐 8）')
+    ap.add_argument('--arch', default='fastvit', choices=['fastvit', 'transformer', 'cnn'],
+                    help='模型结构：fastvit（默认，论文同款窗口单标签）/ transformer（密集头）/ cnn（空洞卷积）')
+    ap.add_argument('--freeze', type=int, default=0,
+                    help='fastvit 前 N epoch 冻结 backbone 只训头（0=不冻，直接判别式 lr 全参）')
     ap.add_argument('--dmodel', type=int, default=D_MODEL)
     ap.add_argument('--dropout', type=float, default=0.2)
     ap.add_argument('--drop', type=float, default=0.3,
@@ -240,7 +328,8 @@ def main():
         else:
             val_mask = np.random.default_rng(0).random(len(Y)) < 0.2
     tr_mask = ~val_mask
-    print(f'train {tr_mask.sum()} / val {val_mask.sum()} windows, K={num_classes}')
+    dense = args.arch != 'fastvit'
+    print(f'train {tr_mask.sum()} / val {val_mask.sum()} windows, K={num_classes}, arch={args.arch}')
 
     if args.device:
         device = torch.device(args.device)
@@ -259,38 +348,68 @@ def main():
     pin = device.type == 'cuda'
     common_dl_kwargs = dict(num_workers=args.workers, pin_memory=pin,
                             persistent_workers=args.workers > 0)
-    train_dl = DataLoader(DenseDataset(X[tr_mask], Y[tr_mask], augment=True, drop=args.drop),
+    train_dl = DataLoader(DenseDataset(X[tr_mask], Y[tr_mask], augment=True, drop=args.drop,
+                                       win_label=not dense),
                           batch_size=args.batch, shuffle=True, **common_dl_kwargs)
-    val_dl = DataLoader(DenseDataset(X[val_mask], Y[val_mask]),
+    val_dl = DataLoader(DenseDataset(X[val_mask], Y[val_mask], win_label=not dense),
                         batch_size=args.batch, **common_dl_kwargs)
 
-    model = DenseGestureModel(num_classes, d_model=args.dmodel, layers=args.layers,
-                              dropout=args.dropout).to(device)
+    model = build_model(args.arch, num_classes, d_model=args.dmodel, layers=args.layers,
+                        dropout=args.dropout).to(device)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f'params: {n_params:.2f}M')
 
     criterion = nn.CrossEntropyLoss()
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
     # 续训：从 last.pt 恢复模型/优化器/调度器/epoch 进度
     start_ep = 0
+    ck = None
     if os.path.exists(args.last) and not args.reset:
         ck = torch.load(args.last, map_location='cpu', weights_only=True)
-        # 只拦截影响权重形状的配置（dmodel/layers/num_classes）；
+        # 只拦截影响权重形状的配置（arch/dmodel/layers/num_classes；fastvit 无视后两者）；
         # dropout/drop 不改变形状，改了可无缝续训
-        if ck.get('dmodel', D_MODEL) != args.dmodel or ck.get('layers', 4) != args.layers \
+        if ck.get('arch', 'transformer') != args.arch \
+                or (args.arch != 'fastvit' and (ck.get('dmodel', D_MODEL) != args.dmodel
+                                                or ck.get('layers', 4) != args.layers)) \
                 or int(ck['num_classes']) != num_classes:
             raise SystemExit(f'{args.last} 模型配置与当前参数不一致，如需重头训练请加 --reset')
         model.load_state_dict(ck['model'])
-        opt.load_state_dict(ck['opt'])
-        sched.load_state_dict(ck['sched'])
         start_ep = int(ck['epoch'])
         print(f'续训: 从 epoch {start_ep} 继续 ({args.last})')
 
+    # fastvit：判别式学习率（backbone 预训练少动）；--freeze 仅对新训生效
+    frozen = args.freeze > 0 and args.arch == 'fastvit' and start_ep == 0
+    if frozen:
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+        opt = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=args.wd)
+    elif args.arch == 'fastvit':
+        opt = torch.optim.AdamW([
+            {'params': model.head.parameters(), 'lr': args.lr},
+            {'params': model.backbone.parameters(), 'lr': args.lr * 0.1},
+        ], weight_decay=args.wd)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    if ck is not None and start_ep > 0:
+        opt.load_state_dict(ck['opt'])
+        sched.load_state_dict(ck['sched'])
+
     for ep in range(start_ep, args.epochs):
-        tl, ta = run_epoch(model, train_dl, device, criterion, opt, amp=amp, scaler=scaler)
-        vl, va = run_epoch(model, val_dl, device, criterion, amp=amp, scaler=scaler)
+        if frozen and ep == args.freeze:
+            # 解冻 backbone，换判别式 lr 优化器继续
+            for p in model.backbone.parameters():
+                p.requires_grad = True
+            opt = torch.optim.AdamW([
+                {'params': model.head.parameters(), 'lr': args.lr},
+                {'params': model.backbone.parameters(), 'lr': args.lr * 0.1},
+            ], weight_decay=args.wd)
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs - ep)
+            frozen = False
+        tl, ta = run_epoch(model, train_dl, device, criterion, opt, amp=amp, scaler=scaler,
+                           dense=dense)
+        vl, va = run_epoch(model, val_dl, device, criterion, amp=amp, scaler=scaler,
+                           dense=dense)
         sched.step()
         print(f'[ep{ep:03d}] train {tl:.3f}/{ta:.2f} | val {vl:.3f}/{va:.2f}')
         # 每个 epoch 覆盖保存 last，随时可中断后续训
@@ -300,9 +419,9 @@ def main():
                   'sched': sched.state_dict(), 'epoch': ep + 1,
                   'num_classes': num_classes, 'layers': args.layers,
                   'dmodel': args.dmodel, 'dropout': args.dropout,
-                  'val_step_acc': va}
+                  'arch': args.arch, 'val_step_acc': va}
             safe_save(ck, args.last)
-    print(f'done -> {args.last} | window-acc {window_acc(model, val_dl, device):.2f}')
+    print(f'done -> {args.last} | window-acc {window_acc(model, val_dl, device, dense=dense):.2f}')
 
 
 if __name__ == '__main__':

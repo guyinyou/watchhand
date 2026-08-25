@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from train import DenseGestureModel, DenseDataset, OUT_IDX
+from train import build_model, DenseDataset, OUT_IDX
 
 
 def main():
@@ -42,9 +42,10 @@ def main():
             device = torch.device('cpu')
     if device.type == 'cuda':
         torch.set_float32_matmul_precision('high')
-    model = DenseGestureModel(num_classes, d_model=ck.get('dmodel', 256),
-                              layers=ck.get('layers', 4),
-                              dropout=ck.get('dropout', 0.2)).to(device)
+    model = build_model(ck.get('arch', 'transformer'), num_classes,
+                        d_model=ck.get('dmodel', 256),
+                        layers=ck.get('layers', 4),
+                        dropout=ck.get('dropout', 0.2)).to(device)
     model.load_state_dict(ck['model'])
     model.eval()
 
@@ -56,7 +57,9 @@ def main():
         mask = split == 'test'
     else:
         mask = np.ones(len(split), dtype=bool)
-    test_dl = DataLoader(DenseDataset(X[mask], Y[mask]), batch_size=args.batch,
+    dense = ck.get('arch', 'transformer') != 'fastvit'
+    test_dl = DataLoader(DenseDataset(X[mask], Y[mask], win_label=not dense),
+                         batch_size=args.batch,
                          num_workers=args.workers, pin_memory=device.type == 'cuda',
                          persistent_workers=args.workers > 0)
 
@@ -65,9 +68,14 @@ def main():
     with torch.no_grad():
         for x, y in test_dl:
             x = x.to(device, non_blocking=True)
-            pred = model(x).argmax(-1)                     # (B, 12)
-            pred_list.append(pred.cpu().numpy())
-            targ_list.append(y[:, OUT_IDX].numpy())
+            pred = model(x).argmax(-1)
+            if dense:
+                pred_list.append(pred.cpu().numpy())       # (B, 12)
+                targ_list.append(y[:, OUT_IDX].numpy())
+            else:
+                # fastvit 窗口单标签：(B,1) 走同一套向量化统计
+                pred_list.append(pred.cpu().numpy()[:, None])
+                targ_list.append(y.numpy()[:, None])
 
     # 全量向量化统计，避免逐样本 Python 循环
     P = np.concatenate(pred_list).reshape(-1)

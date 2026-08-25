@@ -390,9 +390,17 @@ public class WatchHandServer {
             float[][][] x = buildInput(orig);
             try (OnnxTensor in = OnnxTensor.createTensor(ortEnv, new float[][][][]{x});
                  OrtSession.Result res = ortSession.run(java.util.Collections.singletonMap("x", in))) {
-                float[][][] logits = (float[][][]) res.get(0).getValue();
-                predNumClasses = logits[0].length;
-                return logits[0][logits[0].length - 1];
+                // 兼容两种输出：(1,K) 窗口单标签（fastvit）/ (1,12,K) 密集头取末步
+                Object v = res.get(0).getValue();
+                float[] last;
+                if (v instanceof float[][]) {
+                    last = ((float[][]) v)[0];
+                } else {
+                    float[][][] t = (float[][][]) v;
+                    last = t[0][t[0].length - 1];
+                }
+                predNumClasses = last.length;
+                return last;
             }
         } catch (Exception e) {
             return null;

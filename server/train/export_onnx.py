@@ -13,7 +13,7 @@ import argparse
 
 import torch
 
-from train import DenseGestureModel
+from train import build_model
 
 
 def main():
@@ -23,10 +23,10 @@ def main():
     args = ap.parse_args()
 
     ck = torch.load(args.last, map_location='cpu', weights_only=True)
-    model = DenseGestureModel(int(ck['num_classes']),
-                              d_model=ck.get('dmodel', 256),
-                              layers=ck.get('layers', 4),
-                              dropout=ck.get('dropout', 0.2))
+    model = build_model(ck.get('arch', 'transformer'), int(ck['num_classes']),
+                        d_model=ck.get('dmodel', 256),
+                        layers=ck.get('layers', 4),
+                        dropout=ck.get('dropout', 0.2))
     model.load_state_dict(ck['model'])
     model.eval()
 
