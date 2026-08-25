@@ -54,17 +54,29 @@ def no_interrupt():
 
 
 def safe_save(ck, path):
-    """原子保存 + Windows 文件占用容错：
-    先写 tmp 再 rename；rename 被占用（杀毒/索引器/其他进程）时重试，
-    持续失败则落盘为备份名，绝不让保存失败打断训练。"""
+    """原子保存 + 全链路容错：先写 tmp 再 rename。
+    写盘失败（杀毒/索引器抢文件、I/O 抖动）时删掉残 tmp 重试；
+    rename 被占用时重试；持续失败则落盘为备份名，绝不让保存失败打断训练。"""
     tmp = path + '.tmp'
-    torch.save(ck, tmp)
-    for _ in range(5):
+    for attempt in range(3):                        # 整个 写+rename 最多试 3 次
         try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            time.sleep(1.0)
+            torch.save(ck, tmp)
+        except (OSError, RuntimeError):             # torch 写 zip 失败抛 RuntimeError
+            if attempt == 2:
+                raise
+            print(f'警告: 检查点写入失败，{attempt + 2}/3 重试')
+            try:
+                os.remove(tmp)                      # 清理残缺 tmp 再重来
+            except OSError:
+                pass
+            time.sleep(2.0)
+            continue
+        for _ in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(1.0)
     backup = f'{path}.ep{ck["epoch"]}'
     os.replace(tmp, backup)
     print(f'警告: {path} 被占用，本 epoch 检查点已存为 {backup}')
@@ -199,6 +211,10 @@ class CnnDenseModel(nn.Module):
         return self.head(h.permute(0, 2, 1)[:, OUT_IDX])  # (B, 12, K)
 
 
+FASTVIT_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'fastvit_t12_in1k.safetensors')
+
+
 class FastViTModel(nn.Module):
     """论文同款主干：FastViT-T12（ImageNet 预训练，卷积为主快而稳）。
     整窗 2×64×96 当时空图像一次前向，全局池化 → 10 类头，窗口级单标签。"""
@@ -206,8 +222,43 @@ class FastViTModel(nn.Module):
     def __init__(self, num_classes, dropout=0.2, pretrained=True):
         super().__init__()
         import timm
-        self.backbone = timm.create_model('fastvit_t12', pretrained=pretrained,
+        self.backbone = timm.create_model('fastvit_t12', pretrained=False,
                                           in_chans=2, num_classes=0)
+        if pretrained and not os.path.exists(FASTVIT_LOCAL):
+            # 本地无权重时回退在线下载（需能访问 huggingface，可设 HTTPS_PROXY/HF_ENDPOINT）
+            print('本地无预训练权重，尝试在线下载...'
+                  '（可先 python download_fastvit_weights.py 预先下载）')
+            self.backbone = timm.create_model('fastvit_t12', pretrained=True,
+                                              in_chans=2, num_classes=0)
+        elif pretrained:
+            # 本地加载：与 timm 在线路径等价，绕过 huggingface_hub 的代理兼容问题
+            from safetensors.torch import load_file
+            from timm.models._builder import adapt_input_conv
+            sd = load_file(FASTVIT_LOCAL)
+            # 3→2 输入通道适配：timm 在线路径只适配首卷积，遇 conv_scale 等
+            # 其他按输入通道建的卷积会直接崩，这里对所有输入维不匹配的卷积逐个适配
+            model_sd = self.backbone.state_dict()
+            adapted, dropped = [], []
+            for k, v in list(sd.items()):
+                target = model_sd.get(k)
+                if target is None or target.shape == v.shape:
+                    continue
+                if v.dim() == 4 and target.shape[0] == v.shape[0] and target.shape[2:] == v.shape[2:]:
+                    try:
+                        sd[k] = adapt_input_conv(target.shape[1], v)
+                        adapted.append(k)
+                        continue
+                    except NotImplementedError:
+                        pass
+                del sd[k]                        # 形状无法适配 → 丢弃，随机初始化
+                dropped.append(k)
+            sd = {k: v for k, v in sd.items() if not k.startswith('head')}
+            msg = self.backbone.load_state_dict(sd, strict=False)
+            unexpected_missing = [k for k in msg.missing_keys if k not in dropped]
+            if unexpected_missing:
+                raise RuntimeError(f'fastvit 本地权重缺键: {unexpected_missing[:5]}')
+            print(f'fastvit ImageNet 预训练权重已加载（本地 {os.path.basename(FASTVIT_LOCAL)}）'
+                  f' 通道适配 {adapted}，随机初始化 {dropped}')
         d = self.backbone.num_features
         self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d, num_classes))
 
@@ -285,6 +336,9 @@ def main():
     ap.add_argument('--workers', type=int, default=0,
                     help='DataLoader 并行预处理进程数（cuda 下建议 2-4）')
     ap.add_argument('--lr', type=float, default=1e-4)
+    ap.add_argument('--lr-mult', type=float, default=1.0,
+                    help='学习率倍率：所有 lr（含判别式 lr）乘以此值，10 即加速 10 倍；'
+                         '续训时按与检查点内旧倍率的比例自动缩放')
     ap.add_argument('--wd', type=float, default=1e-3)
     ap.add_argument('--layers', type=int, default=4, help='transformer 层数 (2=small)；cnn 架构下为空洞块数（推荐 8）')
     ap.add_argument('--arch', default='fastvit', choices=['fastvit', 'transformer', 'cnn'],
@@ -341,7 +395,7 @@ def main():
     elif args.amp:
         print('警告: --amp 仅 cuda 生效，当前设备忽略')
     amp = args.amp and device.type == 'cuda'
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp)
     print('device:', device, '| amp:', amp)
 
     # num_workers>0 时增强/归一化在子进程并行做，pin_memory 加速 H2D 拷贝
@@ -378,22 +432,42 @@ def main():
         print(f'续训: 从 epoch {start_ep} 继续 ({args.last})')
 
     # fastvit：判别式学习率（backbone 预训练少动）；--freeze 仅对新训生效
+    lr = args.lr * args.lr_mult
     frozen = args.freeze > 0 and args.arch == 'fastvit' and start_ep == 0
     if frozen:
         for p in model.backbone.parameters():
             p.requires_grad = False
-        opt = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=args.wd)
+        opt = torch.optim.AdamW(model.head.parameters(), lr=lr, weight_decay=args.wd)
     elif args.arch == 'fastvit':
         opt = torch.optim.AdamW([
-            {'params': model.head.parameters(), 'lr': args.lr},
-            {'params': model.backbone.parameters(), 'lr': args.lr * 0.1},
+            {'params': model.head.parameters(), 'lr': lr},
+            {'params': model.backbone.parameters(), 'lr': lr * 0.1},
         ], weight_decay=args.wd)
     else:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     if ck is not None and start_ep > 0:
         opt.load_state_dict(ck['opt'])
         sched.load_state_dict(ck['sched'])
+        if sched.T_max != args.epochs:
+            # 总 epoch 数变了：按新长度重排余弦曲线，否则旧 T_max 会让
+            # lr 以旧周期来回振荡（CosineAnnealingLR 超出 T_max 后不收敛到 0）
+            print(f'注意: --epochs 从 {sched.T_max} 改为 {args.epochs}，'
+                  f'余弦退火已按新长度重排（当前 lr 从接近峰值平滑衰减）')
+            sched.T_max = args.epochs
+        # 期望首组 lr（head/单组）vs 检查点保存的初始 lr：
+        # 统一覆盖 --lr 与 --lr-mult 两者的变化，同参重启 ratio=1 不会累计放大
+        ratio = (args.lr * args.lr_mult) / ck['opt']['param_groups'][0]['initial_lr']
+        if abs(ratio - 1.0) > 1e-9:
+            # 等比缩放恢复出的当前 lr、初始 lr 和调度器基线，
+            # 余弦曲线形状不变，只是幅度按新配置拉伸
+            for g in opt.param_groups:
+                g['lr'] *= ratio
+                g['initial_lr'] *= ratio
+            sched.base_lrs = [b * ratio for b in sched.base_lrs]
+            print(f'注意: 学习率配置变化，已等比缩放 {ratio:.2f}x'
+                  f'（lr {ck["opt"]["param_groups"][0]["initial_lr"]:.2e} -> '
+                  f'{args.lr * args.lr_mult:.2e}）')
 
     for ep in range(start_ep, args.epochs):
         if frozen and ep == args.freeze:
@@ -401,8 +475,8 @@ def main():
             for p in model.backbone.parameters():
                 p.requires_grad = True
             opt = torch.optim.AdamW([
-                {'params': model.head.parameters(), 'lr': args.lr},
-                {'params': model.backbone.parameters(), 'lr': args.lr * 0.1},
+                {'params': model.head.parameters(), 'lr': lr},
+                {'params': model.backbone.parameters(), 'lr': lr * 0.1},
             ], weight_decay=args.wd)
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs - ep)
             frozen = False
@@ -419,7 +493,8 @@ def main():
                   'sched': sched.state_dict(), 'epoch': ep + 1,
                   'num_classes': num_classes, 'layers': args.layers,
                   'dmodel': args.dmodel, 'dropout': args.dropout,
-                  'arch': args.arch, 'val_step_acc': va}
+                  'arch': args.arch, 'val_step_acc': va,
+                  'lr_mult': args.lr_mult}
             safe_save(ck, args.last)
     print(f'done -> {args.last} | window-acc {window_acc(model, val_dl, device, dense=dense):.2f}')
 
