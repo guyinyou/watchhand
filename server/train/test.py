@@ -42,10 +42,12 @@ def main():
             device = torch.device('cpu')
     if device.type == 'cuda':
         torch.set_float32_matmul_precision('high')
+    # last.pt 已含完整权重，pretrained=False 跳过预训练下载
     model = build_model(ck.get('arch', 'transformer'), num_classes,
                         d_model=ck.get('dmodel', 256),
                         layers=ck.get('layers', 4),
-                        dropout=ck.get('dropout', 0.2)).to(device)
+                        dropout=ck.get('dropout', 0.2),
+                        pretrained=False).to(device)
     model.load_state_dict(ck['model'])
     model.eval()
 

@@ -23,10 +23,12 @@ def main():
     args = ap.parse_args()
 
     ck = torch.load(args.last, map_location='cpu', weights_only=True)
+    # last.pt 已含完整权重，pretrained=False 跳过预训练下载
     model = build_model(ck.get('arch', 'transformer'), int(ck['num_classes']),
                         d_model=ck.get('dmodel', 256),
                         layers=ck.get('layers', 4),
-                        dropout=ck.get('dropout', 0.2))
+                        dropout=ck.get('dropout', 0.2),
+                        pretrained=False)
     model.load_state_dict(ck['model'])
     model.eval()
 
