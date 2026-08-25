@@ -290,7 +290,7 @@ def main():
     ap.add_argument('--arch', default='fastvit', choices=['fastvit', 'transformer', 'cnn'],
                     help='模型结构：fastvit（默认，论文同款窗口单标签）/ transformer（密集头）/ cnn（空洞卷积）')
     ap.add_argument('--freeze', type=int, default=0,
-                    help='fastvit 前 N epoch 冻结 backbone 只训头（0=不冻，直接判别式 lr 全参）')
+                    help='fastvit 在 epoch N 之前冻结 backbone 只训头（N>=epochs 即全程只训 head，续训也生效；0=不冻）')
     ap.add_argument('--dmodel', type=int, default=D_MODEL)
     ap.add_argument('--dropout', type=float, default=0.2)
     ap.add_argument('--drop', type=float, default=0.3,
@@ -379,12 +379,16 @@ def main():
         start_ep = int(ck['epoch'])
         print(f'续训: 从 epoch {start_ep} 继续 ({args.last})')
 
-    # fastvit：判别式学习率（backbone 预训练少动）；--freeze 仅对新训生效
-    frozen = args.freeze > 0 and args.arch == 'fastvit' and start_ep == 0
+    # fastvit：--freeze N = epoch N 之前冻 backbone 只训 head（N>=epochs 全程冻结，续训也生效）
+    frozen = args.arch == 'fastvit' and args.freeze > start_ep
     if frozen:
         for p in model.backbone.parameters():
             p.requires_grad = False
         opt = torch.optim.AdamW(model.head.parameters(), lr=args.lr, weight_decay=args.wd)
+        n_bb = sum(p.numel() for p in model.backbone.parameters())
+        n_hd = sum(p.numel() for p in model.head.parameters())
+        scope = '全程只训 head' if args.freeze >= args.epochs else f'epoch {args.freeze} 前只训 head'
+        print(f'freeze 生效: backbone {n_bb / 1e6:.2f}M 冻结，{scope}（可训 {n_hd / 1e6:.3f}M）')
     elif args.arch == 'fastvit':
         opt = torch.optim.AdamW([
             {'params': model.head.parameters(), 'lr': args.lr},
@@ -393,15 +397,20 @@ def main():
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    if ck is not None and start_ep > 0:
-        opt.load_state_dict(ck['opt'])
-        sched.load_state_dict(ck['sched'])
+    if ck is not None and start_ep > 0 and not frozen:
+        try:
+            opt.load_state_dict(ck['opt'])
+            sched.load_state_dict(ck['sched'])
+        except (ValueError, KeyError):
+            # 优化器参数组与检查点不一致（如 head-only <-> 全参切换）→ 新优化器继续
+            print('警告: 优化器状态与检查点不匹配，使用新优化器继续')
 
     for ep in range(start_ep, args.epochs):
         if frozen and ep == args.freeze:
             # 解冻 backbone，换判别式 lr 优化器继续
             for p in model.backbone.parameters():
                 p.requires_grad = True
+            print(f'epoch {ep}: 解冻 backbone，切换判别式 lr 全参训练')
             opt = torch.optim.AdamW([
                 {'params': model.head.parameters(), 'lr': args.lr},
                 {'params': model.backbone.parameters(), 'lr': args.lr * 0.1},
