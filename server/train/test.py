@@ -59,7 +59,7 @@ def main():
         mask = split == 'test'
     else:
         mask = np.ones(len(split), dtype=bool)
-    dense = ck.get('arch', 'transformer') != 'fastvit'
+    dense = ck.get('arch', 'transformer') == 'transformer'
     test_dl = DataLoader(DenseDataset(X[mask], Y[mask], win_label=not dense),
                          batch_size=args.batch,
                          num_workers=args.workers, pin_memory=device.type == 'cuda',

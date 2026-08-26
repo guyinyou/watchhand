@@ -225,26 +225,28 @@ class DenseGestureModel(nn.Module):
         return self.head(h[:, OUT_IDX])                  # (B, 12, K)
 
 
-class _CausalDilatedBlock(nn.Module):
-    """因果空洞卷积残差块：左侧补 2*dilation 保证只看过去。"""
+class _DilatedBlock(nn.Module):
+    """空洞卷积残差块：对称 padding（同长输出）。
+    模型整窗输入、只取最后时间步，窗口内所有帧在预测时刻均已存在，
+    无需因果约束。"""
 
     def __init__(self, d, dil, dropout):
         super().__init__()
-        self.pad = 2 * dil
-        self.conv = nn.Conv1d(d, d, 3, dilation=dil)
+        self.conv = nn.Conv1d(d, d, 3, dilation=dil, padding=dil)
         self.bn = nn.BatchNorm1d(d)
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        h = F.pad(x, (self.pad, 0))
-        h = self.conv(h)
+        h = self.conv(x)
         return x + self.drop(F.relu(self.bn(h)))
 
 
-class CnnDenseModel(nn.Module):
-    """帧 CNN + 因果空洞 1D 卷积时间栈 + 密集头。
-    用空洞卷积替代 Transformer 的 96² 注意力，MPS 上快数倍；
-    空洞循环 (1,2,4,8) 堆叠感受野，layers=8 时覆盖 ~61 帧历史。"""
+class CnnModel(nn.Module):
+    """帧 CNN + 空洞 1D 卷积时间栈，整窗单标签（同 fastvit 语义）。
+    输入 (B, 2, 64, T)，T 由数据集决定（如 w32 = 32 帧）；
+    帧 CNN 把每帧压成 d_model 维特征，空洞循环 (1,2,4,8) 堆叠感受野，
+    取最后一个时间步（最新帧，此时卷积已看到整窗历史）→ K 类，
+    对齐部署时"预测当前手势"语义。"""
 
     def __init__(self, num_classes, d_model=D_MODEL, layers=8, dropout=0.2):
         super().__init__()
@@ -257,14 +259,14 @@ class CnnDenseModel(nn.Module):
             nn.AvgPool2d(kernel_size=(8, 1)),
         )
         self.temporal = nn.Sequential(*[
-            _CausalDilatedBlock(d_model, 2 ** (i % 4), dropout) for i in range(layers)
+            _DilatedBlock(d_model, 2 ** (i % 4), dropout) for i in range(layers)
         ])
         self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(d_model, num_classes))
 
     def forward(self, x):
-        f = self.frame_cnn(x).squeeze(2)                 # (B, D, 96)
-        h = self.temporal(f)                             # (B, D, 96) 因果
-        return self.head(h.permute(0, 2, 1)[:, OUT_IDX])  # (B, 12, K)
+        f = self.frame_cnn(x).squeeze(2)                 # (B, D, T)
+        h = self.temporal(f)                             # (B, D, T)
+        return self.head(h[:, :, -1])                    # (B, K) 最后时间步 = 最新帧
 
 
 class FastViTModel(nn.Module):
@@ -285,7 +287,7 @@ class FastViTModel(nn.Module):
 
 def build_model(arch, num_classes, d_model, layers, dropout, pretrained=True):
     if arch == 'cnn':
-        return CnnDenseModel(num_classes, d_model=d_model, layers=layers, dropout=dropout)
+        return CnnModel(num_classes, d_model=d_model, layers=layers, dropout=dropout)
     if arch == 'fastvit':
         return FastViTModel(num_classes, dropout=dropout, pretrained=pretrained)
     return DenseGestureModel(num_classes, d_model=d_model, layers=layers, dropout=dropout)
@@ -400,7 +402,7 @@ def main():
         else:
             val_mask = np.random.default_rng(0).random(len(Y)) < 0.2
     tr_mask = ~val_mask
-    dense = args.arch != 'fastvit'
+    dense = args.arch == 'transformer'
     print(f'train {tr_mask.sum()} / val {val_mask.sum()} windows, K={num_classes}, arch={args.arch}')
 
     if args.device:

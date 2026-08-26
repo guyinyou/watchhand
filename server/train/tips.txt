@@ -2,8 +2,15 @@ cd D:\Study\Java\watchhand\server\train
 python extract.py          																				# 1. 提取数据
 python train.py --device cuda --epochs 30000 --batch 768 --workers 4 --amp --aug-cache 0           		# 2. 训练（续训）
 python train.py --device cuda --epochs 1300 --batch 512 --workers 4 --amp --layers 2 --dmodel 128
+python train.py --device cuda --epochs 1300 --batch 512 --workers 4 --amp --layers 2 --dmodel 128 --arch cnn
 python test.py --split train          																	# 3. 评估
 python export_onnx.py      																				# 4. 导出 ONNX
+
+
+
+python train.py --data dataset_w32.npz --device cuda --epochs 1300 --batch 512 --workers 4 --amp --layers 2 --dmodel 128 --arch cnn
+python test.py  --data dataset_w32.npz --split train
+python export_onnx.py --window 32 --out last_w32.onnx
 
 
 
