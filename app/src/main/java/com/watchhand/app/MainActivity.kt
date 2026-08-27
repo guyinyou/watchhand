@@ -25,10 +25,15 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
 
+/** 本地录制状态机：IDLE -> RECORDING -> CONFIRM_SAVE -> IDLE */
+enum class RecState { IDLE, RECORDING, CONFIRM_SAVE }
+
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 页面常亮：采集/录制期间避免熄屏（前台有效，无需权限）
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContent {
             MaterialTheme {
                 WatchHandScreen()
@@ -62,6 +67,13 @@ fun WatchHandScreen() {
     var tcpClient by remember { mutableStateOf<TcpAudioClient?>(null) }
     var tcpStatus by remember { mutableStateOf("未连接") }
     var isTcpConnecting by remember { mutableStateOf(false) }
+
+    // 本地训练数据录制状态
+    var recState by remember { mutableStateOf(RecState.IDLE) }
+    var recLabel by remember { mutableIntStateOf(0) }
+    var recElapsedSec by remember { mutableIntStateOf(0) }
+    var recResult by remember { mutableStateOf<LocalRecorder.Result?>(null) }
+    var pendingRecordLabel by remember { mutableIntStateOf(-1) }  // 等待录音权限授予后要开始的录制 label
 
     // Percentile clipping range for visualization
     var visRange by remember { mutableStateOf("-") }
@@ -140,30 +152,127 @@ fun WatchHandScreen() {
         audioManager?.let { actualRate = it.actualSampleRate }
     }
 
-    // Permission launcher
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
+    // 启动音频管线（FMCW 播放 + 录音），若已在运行则跳过
+    val startAudioPipeline: () -> Unit = {
+        if (audioManager == null) {
             isRecording = true
             statusText = "正在初始化..."
-            
+
             appendLog("Creating AudioManager (TCP singleton: ${TcpAudioClient.instance != null})")
-            
+
             val manager = AudioManager(
                 context = context,
                 onEchoProfileUpdate = onProfileUpdate,
                 onStatusUpdate = onStatus,
                 onSampleRateUpdate = { rate ->
                     actualRate = rate
+                    // 录制会话开始后首个样本到达前修正实际采样率（保证时长上限与 meta 一致）
+                    LocalRecorder.instance?.updateSampleRate(rate)
                     appendLog("实际采样率: ${rate}Hz")
                 }
             )
             audioManager = manager
             manager.start()
+        }
+    }
+
+    // 停止音频管线
+    val stopAudioPipeline: () -> Unit = {
+        audioManager?.stop()
+        audioManager = null
+        isRecording = false
+        statusText = "已停止"
+    }
+
+    // 结束本次录制（手动停止 / 到时自动停止共用）：震动提醒 + 进入保存确认态
+    val stopRecordingFlow: () -> Unit = {
+        val result = LocalRecorder.instance?.stop()
+        recResult = result
+        recState = RecState.CONFIRM_SAVE
+        // 录制结束震动提醒（双脉冲）
+        try {
+            val vibrator = context.getSystemService(android.os.Vibrator::class.java)
+            vibrator?.vibrate(
+                android.os.VibrationEffect.createWaveform(longArrayOf(0, 200, 100, 200), -1)
+            )
+        } catch (e: Exception) {
+            appendLog("震动提醒失败: ${e.message}")
+        }
+        if (result != null) {
+            appendLog("录制结束: label=${result.label}, ${result.numSamples} samples (${String.format("%.1f", result.durationS)}s)")
+        }
+    }
+
+    // 点击 label 按钮开始本地录制
+    val doStartRecording: (Int) -> Unit = { label ->
+        // 录制与 TCP 互斥：自动断开已连接的 TCP
+        TcpAudioClient.instance?.takeIf { it.isConnected() }?.let {
+            it.disconnect()
+            tcpClient = null
+            tcpStatus = "未连接"
+            isTcpConnecting = false
+            appendLog("TCP 已自动断开（开始本地录制）")
+        }
+        val dir = context.getExternalFilesDir("recordings")
+        if (dir == null) {
+            appendLog("存储目录不可用，无法录制")
         } else {
+            val recorder = LocalRecorder(dir, onAutoStop = stopRecordingFlow)
+            val rate = audioManager?.actualSampleRate ?: actualRate
+            if (recorder.start(label, rate)) {
+                recLabel = label
+                recElapsedSec = 0
+                recState = RecState.RECORDING
+                statusText = "录制中 · Label $label"
+                appendLog("本地录制开始: label=$label, 最长 ${LocalRecorder.MAX_DURATION_S}s")
+                startAudioPipeline()
+            } else {
+                appendLog("录制启动失败（上一会话未结束）")
+            }
+        }
+    }
+
+    // 录制中每秒刷新倒计时显示（实际停止由样本计数触发，见 LocalRecorder.feed）
+    LaunchedEffect(recState) {
+        if (recState == RecState.RECORDING) {
+            recElapsedSec = 0
+            while (recElapsedSec < LocalRecorder.MAX_DURATION_S) {
+                delay(1000)
+                recElapsedSec += 1
+            }
+        }
+    }
+
+    // Permission launcher
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            if (pendingRecordLabel >= 0) {
+                // 权限是为开始录制而申请的
+                val label = pendingRecordLabel
+                pendingRecordLabel = -1
+                doStartRecording(label)
+            } else {
+                startAudioPipeline()
+            }
+        } else {
+            pendingRecordLabel = -1
             statusText = "需要录音权限"
             Toast.makeText(context, "需要录音权限才能使用", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // label 按钮点击入口：检查录音权限
+    val onLabelClick: (Int) -> Unit = { label ->
+        val hasPermission = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (hasPermission) {
+            doStartRecording(label)
+        } else {
+            pendingRecordLabel = label
+            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
@@ -191,26 +300,20 @@ fun WatchHandScreen() {
         Button(
             onClick = {
                 if (isRecording) {
-                    audioManager?.stop()
-                    audioManager = null
-                    isRecording = false
-                    statusText = "已停止"
+                    stopAudioPipeline()
                 } else {
                     val hasPermission = ContextCompat.checkSelfPermission(
                         context, Manifest.permission.RECORD_AUDIO
                     ) == PackageManager.PERMISSION_GRANTED
 
                     if (hasPermission) {
-                        isRecording = true
-                        statusText = "正在初始化..."
-                        val manager = AudioManager(context = context, onEchoProfileUpdate = onProfileUpdate, onStatusUpdate = onStatus)
-                        audioManager = manager
-                        manager.start()
+                        startAudioPipeline()
                     } else {
                         permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                     }
                 }
             },
+            enabled = recState == RecState.IDLE,  // 本地录制期间与可视化采集互斥
             colors = ButtonDefaults.buttonColors(
                 containerColor = if (isRecording) MaterialTheme.colorScheme.error
                 else MaterialTheme.colorScheme.primary
@@ -218,6 +321,59 @@ fun WatchHandScreen() {
             modifier = Modifier.fillMaxWidth().height(48.dp)
         ) {
             Text(if (isRecording) "停止采集" else "开始采集")
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // 训练数据本地录制卡片
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Text("训练数据录制", style = MaterialTheme.typography.titleSmall)
+                Spacer(modifier = Modifier.height(8.dp))
+                if (recState == RecState.RECORDING) {
+                    Text(
+                        text = "录制中 · Label $recLabel",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = "${String.format("%d:%02d", recElapsedSec / 60, recElapsedSec % 60)} / ${LocalRecorder.MAX_DURATION_S / 60}:00",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = stopRecordingFlow,
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Text("停止录制")
+                    }
+                } else {
+                    Text(
+                        text = "点击标签开始录制（最长 ${LocalRecorder.MAX_DURATION_S / 60} 分钟）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        for (label in 0..2) {
+                            Button(
+                                onClick = { onLabelClick(label) },
+                                enabled = recState == RecState.IDLE,
+                                modifier = Modifier.weight(1f).height(56.dp)
+                            ) {
+                                Text("$label", style = MaterialTheme.typography.titleLarge)
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -254,7 +410,7 @@ fun WatchHandScreen() {
                 Button(
                     onClick = onTcpConnectClick,
                     modifier = Modifier.fillMaxWidth().height(40.dp),
-                    enabled = !isTcpConnecting,
+                    enabled = !isTcpConnecting && recState == RecState.IDLE,  // 本地录制期间禁用 TCP
                     colors = ButtonDefaults.buttonColors(
                         containerColor = if (tcpClient?.isConnected() == true)
                             MaterialTheme.colorScheme.error
@@ -336,6 +492,44 @@ fun WatchHandScreen() {
         }
 
         Spacer(modifier = Modifier.height(16.dp))
+    }
+
+    // 录制结束：是否保存确认弹窗
+    if (recState == RecState.CONFIRM_SAVE) {
+        val result = recResult
+        AlertDialog(
+            onDismissRequest = {},  // 必须显式选择保存或丢弃
+            title = { Text("保存本次录制？") },
+            text = {
+                if (result != null) {
+                    Text("Label ${result.label} · 时长 ${String.format("%.1f", result.durationS)} s")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val name = LocalRecorder.instance?.save()
+                    if (name != null) {
+                        appendLog("已保存: $name")
+                        Toast.makeText(context, "已保存 $name", Toast.LENGTH_LONG).show()
+                    } else {
+                        appendLog("保存失败")
+                        Toast.makeText(context, "保存失败", Toast.LENGTH_LONG).show()
+                    }
+                    stopAudioPipeline()
+                    recState = RecState.IDLE
+                    recResult = null
+                }) { Text("保存") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    LocalRecorder.instance?.discard()
+                    appendLog("已丢弃录制数据")
+                    stopAudioPipeline()
+                    recState = RecState.IDLE
+                    recResult = null
+                }) { Text("丢弃") }
+            }
+        )
     }
 }
 

@@ -346,10 +346,12 @@ class AudioManager(
             val read = record.read(readBuffer, 0, readBuffer.size)
             if (read > 0) {
                 val samples = readBuffer.copyOf(read)
-                
-                val tcpConnected = TcpAudioClient.instance?.isConnected() == true
-                
-                if (tcpConnected) {
+
+                val recorder = LocalRecorder.instance
+                if (recorder?.isRecording == true) {
+                    // 本地录制优先：与 TCP 发送同一条数据通路，只写盘，跳过本地处理与 TCP
+                    recorder.feed(samples)
+                } else if (TcpAudioClient.instance?.isConnected() == true) {
                     // TCP connected: only send raw data, skip local processing
                     TcpAudioClient.instance?.sendAudio(samples)
                 } else {
